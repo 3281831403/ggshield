@@ -54,6 +54,10 @@ class SecretConfig(FilteredConfig):
     # so incidents record just the filename (e.g. `config.py` instead of
     # `src/app/config.py`).
     filename_only: bool = False
+    # When True, `secret scan ai-hook` blocks an event it cannot scan instead of
+    # letting it through with a warning. Can be overridden with the
+    # GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR environment variable.
+    fail_on_ai_hook_error: bool = False
 
     def add_ignored_match(self, secret: IgnoredMatch) -> None:
         """
@@ -85,6 +89,7 @@ class SecretConfig(FilteredConfig):
                 ),
                 "fail_on_server_error": self.fail_on_server_error,
                 "filename_only": self.filename_only,
+                "fail_on_ai_hook_error": self.fail_on_ai_hook_error,
             }
         )
 

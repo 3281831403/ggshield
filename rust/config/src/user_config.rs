@@ -44,6 +44,9 @@ pub struct SecretConfig {
     /// When true, ignored secrets are still reported — so they still block.
     pub all_secrets: bool,
     pub filename_only: bool,
+    /// When true, the hook blocks an event it cannot scan instead of letting
+    /// it through with a warning.
+    pub fail_on_ai_hook_error: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -100,6 +103,8 @@ struct RawSecretConfig {
     all_secrets: Option<bool>,
     #[serde(alias = "filename-only")]
     filename_only: Option<bool>,
+    #[serde(alias = "fail-on-ai-hook-error")]
+    fail_on_ai_hook_error: Option<bool>,
 }
 
 /// One `secret.ignored_matches` entry. `name` is never compared, so it is not read
@@ -202,6 +207,10 @@ impl RawUserConfig {
             .or(secret.ignore_known_secrets);
         secret.all_secrets = later.secret.all_secrets.or(secret.all_secrets);
         secret.filename_only = later.secret.filename_only.or(secret.filename_only);
+        secret.fail_on_ai_hook_error = later
+            .secret
+            .fail_on_ai_hook_error
+            .or(secret.fail_on_ai_hook_error);
     }
 
     fn resolve(self) -> Result<UserConfig, Error> {
@@ -228,6 +237,7 @@ impl RawUserConfig {
                     .unwrap_or_default(),
                 all_secrets: self.secret.all_secrets.unwrap_or_default(),
                 filename_only: self.secret.filename_only.unwrap_or_default(),
+                fail_on_ai_hook_error: self.secret.fail_on_ai_hook_error.unwrap_or_default(),
             },
         })
     }
@@ -562,6 +572,27 @@ mod tests {
             merged.resolve().expect("resolves").secret.ignored_matches,
             vec!["aaa", "bbb"]
         );
+    }
+
+    /// GIVEN `secret.fail_on_ai_hook_error` unset, set in either spelling, or set
+    /// to something that is not a boolean
+    /// WHEN the config is loaded
+    /// THEN it defaults to false, is read when set, and a bad value is fatal like
+    /// any other invalid key.
+    #[test]
+    fn fail_on_ai_hook_error_is_read_and_validated() {
+        let of = |yaml: &str| parse(yaml).map(|c| c.secret.fail_on_ai_hook_error);
+        assert!(!of("version: 2\n").expect("parses"));
+        assert!(of("version: 2\nsecret:\n  fail_on_ai_hook_error: true\n").expect("parses"));
+        assert!(of("version: 2\nsecret:\n  fail-on-ai-hook-error: true\n").expect("parses"));
+        assert!(!of("version: 2\nsecret:\n  fail_on_ai_hook_error: false\n").expect("parses"));
+        for bad in ["nope", "block", "[true]"] {
+            let yaml = format!("version: 2\nsecret:\n  fail_on_ai_hook_error: {bad}\n");
+            assert!(
+                matches!(of(&yaml), Err(Error::Fatal(_))),
+                "{bad} must be fatal"
+            );
+        }
     }
 
     /// GIVEN an empty config file
