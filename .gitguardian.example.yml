@@ -40,3 +40,9 @@ secret:
   # Detectors to ignore.
   ignored_detectors: # default: []
     - Generic Password
+
+  # Whether `ggshield secret scan ai-hook` blocks an action it cannot scan
+  # (unrecognized agent, missing token, API error or timeout). When false, it
+  # lets the action through and warns. The environment variable
+  # GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR can also be used to override this.
+  fail_on_ai_hook_error: false # default: false
