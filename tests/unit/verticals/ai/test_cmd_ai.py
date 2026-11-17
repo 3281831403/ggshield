@@ -296,6 +296,53 @@ class TestAiHookCmd:
         assert "NOT scanned" in response["systemMessage"]
 
     @pytest.mark.parametrize(
+        "error",
+        [
+            MissingTokenError(instance="https://dashboard.gitguardian.com"),
+            ConnectionError("server unreachable"),
+        ],
+        ids=["auth", "network"],
+    )
+    @pytest.mark.parametrize("fail", [False, True], ids=["allow", "block"])
+    @patch("ggshield.verticals.ai.hooks._send_desktop_notification")
+    @patch("ggshield.cmd.secret.scan.ai_hook.create_client_from_config")
+    def test_scan_failure_follows_fail_on_ai_hook_error(
+        self,
+        mock_create_client: MagicMock,
+        mock_notify: MagicMock,
+        monkeypatch,
+        fail: bool,
+        error: Exception,
+    ):
+        """
+        GIVEN a Claude Code tool call, and a token or a server that fails
+        WHEN the hook runs with fail_on_ai_hook_error false, then true
+        THEN false lets the call through with the warning in the agent and on
+             stderr, true denies it with the warning as the reason, and neither
+             raises a desktop notification
+        """
+        mock_create_client.side_effect = error
+        monkeypatch.setenv("GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR", str(fail).lower())
+
+        runner = CliRunner()
+        runner.mix_stderr = False
+        result = runner.invoke(
+            cli, ["secret", "scan", "ai-hook"], input=CLAUDE_PRE_TOOL_USE_PAYLOAD
+        )
+
+        assert result.exit_code == 0
+        response = json.loads(result.stdout)
+        assert "NOT scanned for secrets" in result.stderr
+        if not fail:
+            assert response["continue"] is True
+            assert "NOT scanned for secrets" in response["systemMessage"]
+        else:
+            decision = response["hookSpecificOutput"]
+            assert decision["permissionDecision"] == "deny"
+            assert "NOT scanned for secrets" in decision["permissionDecisionReason"]
+        mock_notify.assert_not_called()
+
+    @pytest.mark.parametrize(
         ("env", "config", "exit_code"),
         [
             pytest.param(None, None, 0, id="default"),

@@ -343,6 +343,10 @@ def emit_cannot_scan_response(stdin_content: str, error: Exception, fail: bool) 
         return 1
     warning = _cannot_scan_warning(error)
     ui.display_warning(warning)
+    if fail:
+        return payload.agent.output_result(
+            HookResult(block=True, message=warning, nbr_secrets=0, payload=payload)
+        )
     return payload.agent.output_result(HookResult.allow_with_warning(payload, warning))
 
 

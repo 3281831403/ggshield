@@ -175,11 +175,13 @@ fn cannot_scan(stdin_content: &str, warning: String, fail: bool) -> CannotScan {
         },
         Ok(payloads) if !payloads.is_empty() => {
             let payload = &payloads[payloads.len() - 1];
+            let result = if fail {
+                HookResult::block(payload, warning.clone(), 0)
+            } else {
+                HookResult::allow_with_warning(payload, warning.clone())
+            };
             CannotScan {
-                emission: output::emission(&HookResult::allow_with_warning(
-                    payload,
-                    warning.clone(),
-                )),
+                emission: output::emission(&result),
                 warning,
             }
         }
@@ -605,6 +607,38 @@ mod tests {
                 assert_eq!(answer.warning, error::UNRECOGNIZED_AGENT_WARNING);
             }
         }
+    }
+
+    /// GIVEN a Claude Code tool call that could not be scanned
+    /// WHEN `fail_on_ai_hook_error` is false, then true
+    /// THEN allow lets it through with the warning, and block denies it with
+    /// the warning as the reason.
+    #[test]
+    fn a_known_agent_gets_its_own_answer_per_fail_on_ai_hook_error() {
+        let event = claude_bash_event("ls");
+        let warning = "ggshield could not scan (boom) — this action was NOT scanned for secrets.";
+
+        let allowed = cannot_scan(&event, warning.into(), false);
+        assert_eq!(
+            allowed.emission,
+            Emission::Stdout(
+                serde_json::json!({"continue": true, "systemMessage": warning}),
+                0
+            )
+        );
+
+        let blocked = cannot_scan(&event, warning.into(), true);
+        assert_eq!(
+            blocked.emission,
+            Emission::Stdout(
+                serde_json::json!({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": warning,
+                }}),
+                0
+            )
+        );
     }
 
     /// GIVEN stdin that is not a hook event at all
