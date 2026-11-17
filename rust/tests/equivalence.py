@@ -14,7 +14,7 @@ sides must produce but whose value is allowed to differ (see `same_request`).
   python3 tests/equivalence.py            # equivalence only
   python3 tests/equivalence.py --bench N  # also time both, N iterations/side
 
-Twelve matrices:
+Thirteen matrices:
   agents   6 assistants x their own payload shapes x {clean, secret}
   config   .gitguardian.yaml cases: discovery, precedence, and every key that
            changes the verdict or the request
@@ -31,6 +31,9 @@ Twelve matrices:
   exclude  the default ignored-path wildcards: which files a vendored *name*
            may and may not swallow
   extra    fail-open, and the unrecognized-agent case
+  on_error `secret.fail_on_ai_hook_error` x {false, true}: a missing token
+           and an unreachable API for every agent, an unrecognized agent, and
+           the environment variable overriding the file
   kiro     Kiro, which the Rust hook serves alone: asserted against its
            output contract instead of diffed, there being no Python side
   junie    Junie CLI, likewise Rust-only: Claude Code's verdict schema, its
@@ -1900,6 +1903,202 @@ def extra_cases(tmp):
     return failures
 
 
+UNKNOWN_AGENT_EVENT = {"hook_event_name": "somethingElse", "prompt": "hi"}
+FAIL_ENV = "GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR"
+NO_TOKEN = {"GITGUARDIAN_API_KEY": None}
+NOT_SCANNED = b"NOT scanned for secrets"
+IGNORED_ENV = b"must be a boolean (true/false)"
+# (label, value of the key and the variable, unrecognized-agent exit code)
+MODES = (("allow", "false", 0), ("block", "true", 2))
+
+
+def fail_config(value):
+    return f"version: 2\nsecret:\n  fail_on_ai_hook_error: {value}\n"
+
+
+def on_error_cases():
+    """(name, payload, local yaml, env overrides, exit, verdict, stderr marker).
+
+    No token, so neither side can scan: what is left to compare is how
+    `secret.fail_on_ai_hook_error` answers. The expected exit, verdict and
+    stderr give the matrix teeth: both sides ignoring the setting would still
+    agree.
+    """
+    claude = agent_payloads()["claude"]["pre_bash"]
+    cases = []
+    for mode, value, code in MODES:
+        cases.append(
+            (
+                f"unknown_agent/file_{mode}",
+                UNKNOWN_AGENT_EVENT,
+                fail_config(value),
+                NO_TOKEN,
+                code,
+                "allow",
+                NOT_SCANNED,
+            )
+        )
+        cases.append(
+            (
+                f"unknown_agent/env_{mode}",
+                UNKNOWN_AGENT_EVENT,
+                None,
+                {**NO_TOKEN, FAIL_ENV: value},
+                code,
+                "allow",
+                NOT_SCANNED,
+            )
+        )
+    cases += [
+        (
+            "unknown_agent/default",
+            UNKNOWN_AGENT_EVENT,
+            None,
+            NO_TOKEN,
+            0,
+            "allow",
+            NOT_SCANNED,
+        ),
+        (
+            "unknown_agent/env_overrides_file",
+            UNKNOWN_AGENT_EVENT,
+            fail_config("true"),
+            {**NO_TOKEN, FAIL_ENV: "false"},
+            0,
+            "allow",
+            NOT_SCANNED,
+        ),
+        (
+            "unknown_agent/empty_env_keeps_file",
+            UNKNOWN_AGENT_EVENT,
+            fail_config("true"),
+            {**NO_TOKEN, FAIL_ENV: ""},
+            2,
+            "allow",
+            NOT_SCANNED,
+        ),
+        # Unlike click's usage error, whose exit 2 agents read as a block.
+        (
+            "unknown_agent/invalid_env_keeps_file",
+            UNKNOWN_AGENT_EVENT,
+            fail_config("true"),
+            {**NO_TOKEN, FAIL_ENV: "maybe"},
+            2,
+            "allow",
+            IGNORED_ENV,
+        ),
+        (
+            "no_token/invalid_env_falls_back_to_false",
+            claude,
+            None,
+            {**NO_TOKEN, FAIL_ENV: "maybe"},
+            0,
+            "allow",
+            IGNORED_ENV,
+        ),
+        (
+            "no_token/file_block",
+            claude,
+            fail_config("true"),
+            NO_TOKEN,
+            0,
+            "block",
+            NOT_SCANNED,
+        ),
+        (
+            "no_token/env_overrides_file",
+            claude,
+            fail_config("true"),
+            {**NO_TOKEN, FAIL_ENV: "false"},
+            0,
+            "allow",
+            NOT_SCANNED,
+        ),
+        (
+            "no_token/env_block_overrides_file",
+            claude,
+            fail_config("false"),
+            {**NO_TOKEN, FAIL_ENV: "true"},
+            0,
+            "block",
+            NOT_SCANNED,
+        ),
+    ]
+    # Every agent and event, both modes: each must answer in its own schema.
+    for mode, value, _ in MODES:
+        for agent, shapes in agent_payloads().items():
+            for shape in ("user_prompt", "pre_bash", "post_bash"):
+                if shape not in shapes:
+                    continue
+                cases.append(
+                    (
+                        f"no_token/{mode}/{agent}/{shape}",
+                        shapes[shape],
+                        None,
+                        {**NO_TOKEN, FAIL_ENV: value},
+                        0,
+                        # Only a tool call is blockable by every agent.
+                        mode if shape == "pre_bash" else None,
+                        NOT_SCANNED,
+                    )
+                )
+    return cases
+
+
+def compare_on_error(tmp):
+    failures = []
+    print("\nsecret.fail_on_ai_hook_error: a scan that cannot run, x {false, true}")
+    log = tmp / "requests-on-error.jsonl"
+    mock, port = start_mock("secret", log)
+    try:
+        for name, payload, local, env, code, verdict, stderr in on_error_cases():
+            verdict_ok, request_ok, py, rs, bodies = compare_one(
+                tmp,
+                log,
+                port,
+                f"onerr-{name}".replace("/", "-"),
+                payload,
+                local_config=local,
+                env_extra=env,
+            )
+            report(failures, f"on_error/{name}", verdict_ok, request_ok, py, rs)
+            for side, proc in (("python", py), ("rust", rs)):
+                problems = []
+                if proc.returncode != code:
+                    problems.append(f"exit {proc.returncode}, want {code}")
+                if verdict is not None and verdict_of(proc.stdout) != verdict:
+                    problems.append(
+                        f"verdict {verdict_of(proc.stdout)}, want {verdict}"
+                    )
+                if stderr not in proc.stderr:
+                    problems.append(f"no {stderr.decode()!r} on stderr")
+                if bodies[side]:
+                    problems.append("something was posted")
+                if problems:
+                    failures.append(f"on_error/{name} ({side}: {', '.join(problems)})")
+                    print(f"        ^ {side}: {'; '.join(problems)}")
+    finally:
+        mock.kill()
+
+    # The API itself unreachable: the warning names each side's own connection
+    # error, so only the exit code and the verdict are compared.
+    print("\nsecret.fail_on_ai_hook_error with the API unreachable (shape only):")
+    dead_port = free_port()
+    for mode, value, _ in MODES:
+        for agent in agent_payloads():
+            payload = agent_payloads()[agent]["pre_bash"]
+            seen = {}
+            for side, cmd in (("python", PY_CMD), ("rust", RS_CMD)):
+                workdir = make_workdir(tmp, f"onerr-dead-{mode}-{agent}-{side}")
+                proc, _ = run(cmd, payload, dead_port, workdir, {FAIL_ENV: value})
+                seen[side] = (proc.returncode, verdict_of(proc.stdout))
+            ok = seen["python"] == seen["rust"] == (0, mode)
+            print(f"  [{'OK  ' if ok else 'FAIL'}] {mode}/{agent}: {seen}")
+            if not ok:
+                failures.append(f"on_error/api_unreachable/{mode}/{agent}")
+    return failures
+
+
 def kiro_payloads():
     """Kiro's own shapes, one per surface: the CLI in camelCase, the IDE in
     PascalCase, `fs_read`/`operations` against `read_file`/`offset`.
@@ -2268,6 +2467,7 @@ def main():
         failures += compare_dotenv(tmp)
         failures += compare_exclusions(tmp)
         failures += extra_cases(tmp)
+        failures += compare_on_error(tmp)
         failures += check_kiro(tmp)
         failures += check_junie(tmp)
         if "--bench" in sys.argv:
@@ -2395,6 +2595,22 @@ def main():
                 "the same text. Remove with the Python ai-hook, which is being "
                 "retired; Rust is the reference implementation and this change is "
                 "not back-ported."
+            ),
+            "on_error/no_token/block/claude/user_prompt": (
+                "Claude Code reads `additionalContext` only under "
+                "`hookSpecificOutput`, so the top-level copy Python still emits has "
+                "never reached the model. Rust drops it and suppresses the "
+                "original prompt, as for a secret. Remove with the Python ai-hook, "
+                "which is being retired; Rust is the reference implementation and "
+                "this change is not back-ported."
+            ),
+            "on_error/no_token/block/claude/post_bash": (
+                "Rust returns `hookSpecificOutput.updatedToolOutput`, so the "
+                "unscanned command output is replaced by the warning before "
+                "Claude reads it. Python blocks with the warning beside the "
+                "output. Remove with the Python ai-hook, which is being retired; "
+                "Rust is the reference implementation and this change is not "
+                "back-ported."
             ),
             "exclusion/vendor_ancestor": (
                 "the default wildcards are tested against the path relative to "
