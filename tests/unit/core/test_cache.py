@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,74 @@ class TestCache:
         Cache()
         captured = capsys.readouterr()
         assert "Unrecognized key in cache" in captured.err
+
+    def test_load_truncated_cache(self, capsys):
+        """
+        GIVEN a corrupted (truncated) cache file
+        WHEN Cache is instantiated
+        THEN it does not raise, warns and starts with an empty cache
+        """
+        with open(".cache_ggshield", "w") as file:
+            file.write('{"last_found_secrets": [{"name": "')
+
+        cache = Cache()
+        assert cache.last_found_secrets == []
+        assert "Could not parse" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # valid JSON, but not an object
+            ["not", "a", "dict"],
+            # an entry which is not a valid IgnoredMatch
+            {"last_found_secrets": [{"name": "no match field"}]},
+        ],
+    )
+    def test_load_cache_with_invalid_structure(self, capsys, content):
+        """
+        GIVEN a cache file whose structure does not match the expected schema
+        WHEN Cache is instantiated
+        THEN it does not raise, warns and starts with an empty cache
+        """
+        with open(".cache_ggshield", "w") as file:
+            json.dump(content, file)
+
+        cache = Cache()
+        assert cache.last_found_secrets == []
+        assert "Could not read" in capsys.readouterr().err
+
+    def test_save_empty_cache_removes_file(self):
+        """
+        GIVEN a cache file from a previous run
+        WHEN a scan finds nothing and save is called
+        THEN the stale cache file is removed
+        """
+        with open(".cache_ggshield", "w") as file:
+            json.dump({"last_found_secrets": [{"name": "", "match": "XXX"}]}, file)
+        cache = Cache()
+        assert cache.last_found_secrets != []
+
+        cache.start_scan()
+        cache.save()
+
+        assert cache.last_found_secrets == []
+        assert not os.path.isfile(".cache_ggshield")
+
+    def test_start_scan_resets_only_once(self):
+        """
+        GIVEN a cache shared by concurrent scan batches
+        WHEN start_scan is called again after secrets were recorded
+        THEN the recorded secrets are kept (only the first call resets)
+        """
+        cache = Cache()
+        cache.update_cache(last_found_secrets=[{"match": "OLD"}])
+
+        cache.start_scan()
+        assert cache.last_found_secrets == []
+
+        cache.add_found_policy_break("break_type", "NEW_SHA", "a_file")
+        cache.start_scan()
+        assert [x.match for x in cache.last_found_secrets] == ["NEW_SHA"]
 
     def test_save_cache(self):
         with open(".cache_ggshield", "w") as file:
@@ -110,6 +179,56 @@ class TestCache:
 
         config = Config()
         assert config.user_config.max_commits_for_hook == 75
+
+
+def test_cache_stays_in_invocation_directory(tmp_path):
+    """
+    GIVEN ggshield was invoked from directory A and scans a repository in B
+         (scan commands chdir into the scanned repository)
+    WHEN the cache is saved
+    THEN the cache file is written in A, not in B
+    """
+    invoked_from = tmp_path / "a"
+    scanned_repo = tmp_path / "b"
+    invoked_from.mkdir()
+    scanned_repo.mkdir()
+
+    with cd(invoked_from):
+        cache = Cache()
+        cache.update_cache(last_found_secrets=[{"match": "XXX"}])
+        with cd(scanned_repo):
+            cache.save()
+
+        assert (invoked_from / ".cache_ggshield").is_file()
+        assert not (scanned_repo / ".cache_ggshield").exists()
+
+
+def test_concurrent_batches_do_not_lose_secrets(tmp_path):
+    """
+    GIVEN concurrent scan batches sharing one Cache (as scan_commit_range does)
+    WHEN they reset, record and save secrets from multiple threads
+    THEN no secret found by this process is lost
+    """
+    with cd(tmp_path):
+        cache = Cache()
+
+        def batch(index: int) -> None:
+            cache.start_scan()
+            cache.add_found_policy_break("break_type", f"sha{index}", f"file{index}")
+
+        threads = [threading.Thread(target=batch, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(cache.last_found_secrets) == 8
+
+        cache.save()
+        reloaded = Cache()
+        assert {x.match for x in reloaded.last_found_secrets} == {
+            f"sha{index}" for index in range(8)
+        }
 
 
 def test_auto_ignore_cache_file(tmp_path):

@@ -227,7 +227,7 @@ class SecretScanner:
         Receive scans as they complete, report progress and collect them and return
         a Results.
         """
-        self.cache.purge()
+        self.cache.start_scan()
 
         results = []
         failures: List[click.ClickException] = []
