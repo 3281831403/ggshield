@@ -311,6 +311,19 @@ class SecretScanCollection:
                 if scan.results:
                     yield from scan.results.results
 
+    def get_all_errors(self) -> Iterable[Error]:
+        """Returns an iterable on all errors of this scan and its sub-scans"""
+        if self.results:
+            yield from self.results.errors
+        if self.scans:
+            for scan in self.scans:
+                yield from scan.get_all_errors()
+
+    @property
+    def has_errors(self) -> bool:
+        """True when some content could not be scanned somewhere in the tree"""
+        return any(True for _ in self.get_all_errors())
+
     def get_incident_details(self, client: GGClient) -> Dict[str, SecretIncident]:
         incident_details: dict[str, SecretIncident] = {}
         for result in self.get_all_results():

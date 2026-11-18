@@ -29,6 +29,10 @@ class SecretOutputHandler(ABC):
         self.output = output
         self.ignore_known_secrets = secret_config.ignore_known_secrets
         self.with_incident_details = secret_config.with_incident_details
+        # When fail-open is enabled, unscanned content does not make the command
+        # fail: it only gets reported (see scan_commit_range's --no-fail-on-
+        # server-error handling).
+        self.ignore_unscanned = not secret_config.fail_on_server_error
 
     def process_scan(self, scan: SecretScanCollection) -> ExitCode:
         """Process a scan collection, write the report to :attr:`self.output`
@@ -57,5 +61,8 @@ class SecretOutputHandler(ABC):
 
     def _get_exit_code(self, scan: SecretScanCollection) -> ExitCode:
         if scan.total_secrets_count > 0:
+            return ExitCode.SCAN_FOUND_PROBLEMS
+        if scan.has_errors and not self.ignore_unscanned:
+            # Content was not fully scanned: reporting it as clean would be a lie
             return ExitCode.SCAN_FOUND_PROBLEMS
         return ExitCode.SUCCESS

@@ -405,6 +405,7 @@ def _scan_one_document_per_chunk(
     client: GGClient,
     monkeypatch: pytest.MonkeyPatch,
     responses: List[Any],
+    raise_on_failure: bool = True,
 ) -> Results:
     """
     Scan one document per chunk, the API answering chunk i with responses[i]:
@@ -433,7 +434,11 @@ def _scan_one_document_per_chunk(
         for i, content in enumerate(by_content)
     ]
     with patch("concurrent.futures.as_completed", side_effect=list):
-        return scanner.scan(scannables, scanner_ui=Mock())
+        return scanner.scan(
+            scannables,
+            scanner_ui=Mock(),
+            raise_on_failure=raise_on_failure,
+        )
 
 
 @pytest.mark.parametrize(
@@ -447,7 +452,7 @@ def _scan_one_document_per_chunk(
 )
 @pytest.mark.parametrize("refused_first", [True, False])
 @patch("pygitguardian.GGClient.multi_content_scan")
-def test_scan_reports_secrets_found_next_to_a_refused_chunk(
+def test_scan_fail_fast_raises_next_to_a_secret_chunk(
     scan_mock: Mock,
     client: GGClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -456,20 +461,55 @@ def test_scan_reports_secrets_found_next_to_a_refused_chunk(
 ):
     """
     GIVEN one chunk with a secret and one chunk the API did not scan
-    WHEN SecretScanner.scan() is called
-    THEN the secret is returned instead of being discarded with the scan, so
-    --no-fail-on-server-error cannot turn a found secret into a pass
-    AND the failure is part of the results, for the JSON report
+    WHEN SecretScanner.scan() runs in the default fail-fast mode
+    THEN it raises instead of reporting the scan as clean, whatever the order
     """
     responses = [refusal, _multi_scan_result_with_secret()]
     if not refused_first:
         responses.reverse()
 
-    results = _scan_one_document_per_chunk(scan_mock, client, monkeypatch, responses)
+    with pytest.raises(ServiceUnavailableError):
+        _scan_one_document_per_chunk(scan_mock, client, monkeypatch, responses)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        pytest.param(Detail("Too many requests", 429), id="429"),
+        pytest.param(Detail("Bad gateway", 503), id="503"),
+        pytest.param(requests.exceptions.ConnectionError("boom"), id="unreachable"),
+        pytest.param(Detail("<html>Sign in</html>", 200), id="200 proxy page"),
+    ],
+)
+@pytest.mark.parametrize("refused_first", [True, False])
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_collect_mode_reports_secrets_and_unscanned_files(
+    scan_mock: Mock,
+    client: GGClient,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: Any,
+    refused_first: bool,
+):
+    """
+    GIVEN one chunk with a secret and one chunk the API did not scan
+    WHEN SecretScanner.scan() runs in collect mode (--no-fail-on-server-error)
+    THEN the secret is returned instead of being discarded with the scan, so
+    --no-fail-on-server-error cannot turn a found secret into a pass
+    AND the failure is part of the results, naming the unscanned file
+    """
+    responses = [refusal, _multi_scan_result_with_secret()]
+    if not refused_first:
+        responses.reverse()
+
+    results = _scan_one_document_per_chunk(
+        scan_mock, client, monkeypatch, responses, raise_on_failure=False
+    )
 
     assert results.has_secrets
     assert len(results.errors) == 1
-    assert results.errors[0].description.startswith("Some files were not scanned")
+    error = results.errors[0]
+    assert error.description.startswith("Some files were not scanned")
+    assert error.files == [("file0" if refused_first else "file1", Filemode.FILE)]
 
 
 @patch("pygitguardian.GGClient.multi_content_scan")
@@ -509,6 +549,102 @@ def test_scan_refusal_that_cannot_be_skipped_wins(
 
     with pytest.raises(QuotaLimitReachedError):
         _scan_one_document_per_chunk(scan_mock, client, monkeypatch, responses)
+
+
+@pytest.mark.parametrize("forbidden_first", [True, False])
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_collect_mode_quota_error_still_aborts(
+    scan_mock: Mock,
+    client: GGClient,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_first: bool,
+):
+    """
+    GIVEN one chunk refused for lack of quota and one throttled with a 429
+    WHEN SecretScanner.scan() runs in collect mode
+    THEN the quota error still raises whatever the order, since
+    --no-fail-on-server-error must not skip it
+    """
+    responses = [
+        Detail("Quota limit reached.", 403),
+        Detail("Too many requests", 429),
+    ]
+    if not forbidden_first:
+        responses.reverse()
+
+    with pytest.raises(QuotaLimitReachedError):
+        _scan_one_document_per_chunk(
+            scan_mock, client, monkeypatch, responses, raise_on_failure=False
+        )
+
+
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_collect_mode_400_keeps_the_faulty_files(
+    scan_mock: Mock, client: GGClient, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    GIVEN a chunk the API rejects with a 400 (one faulty document among valid
+    ones) next to a clean chunk
+    WHEN SecretScanner.scan() runs in collect mode
+    THEN the faulty file is reported as unscanned instead of vanishing
+    AND the valid files still produce results
+    """
+    faulty_detail = Detail(
+        "[\"filename:: [ErrorDetail(string='bad', code='invalid')]\", '']", 400
+    )
+    responses = [faulty_detail, _clean_multi_scan_result([{}])]
+
+    results = _scan_one_document_per_chunk(
+        scan_mock, client, monkeypatch, responses, raise_on_failure=False
+    )
+
+    assert len(results.results) == 1
+    assert results.results[0].url == "file1"
+    assert len(results.errors) == 1
+    error = results.errors[0]
+    assert error.description.startswith("Some files were not scanned")
+    assert error.files == [("file0", Filemode.FILE)]
+
+
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_collect_mode_400_without_per_file_detail_marks_whole_chunk(
+    scan_mock: Mock, client: GGClient, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    GIVEN a 400 response whose body is not a per-file detail list
+    WHEN SecretScanner.scan() runs in collect mode
+    THEN every file of the chunk is listed as unscanned
+    """
+    responses = [Detail("Too many documents to scan", 400)]
+
+    results = _scan_one_document_per_chunk(
+        scan_mock, client, monkeypatch, responses, raise_on_failure=False
+    )
+
+    assert results.results == []
+    assert len(results.errors) == 1
+    assert results.errors[0].files == [("file0", Filemode.FILE)]
+
+
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_collect_mode_dedupes_repeated_failures_by_message(
+    scan_mock: Mock, client: GGClient, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    GIVEN two chunks refused with the same throttling response
+    WHEN the scanner failures are merged through report_scan_failures
+    THEN a single error remains, carrying the files of both chunks
+    """
+    from ggshield.verticals.secret.secret_scanner import report_scan_failures
+
+    responses = [Detail("Too many requests", 429), Detail("Too many requests", 429)]
+    results = _scan_one_document_per_chunk(
+        scan_mock, client, monkeypatch, responses, raise_on_failure=False
+    )
+
+    merged = report_scan_failures(results.errors)
+    assert len(merged) == 1
+    assert {filename for filename, _ in merged[0].files} == {"file0", "file1"}
 
 
 def test_scan_merge_commit(client, cache):

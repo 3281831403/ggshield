@@ -12,6 +12,7 @@ from ggshield.core.errors import ExitCode, ServiceUnavailableError, UnexpectedEr
 from ggshield.core.scan import Commit, ScanContext, ScanMode
 from ggshield.core.scan.commit_information import CommitInformation
 from ggshield.core.scan.commit_utils import CommitScannable
+from ggshield.utils.git_shell import Filemode
 from ggshield.verticals.secret import Result, Results
 from ggshield.verticals.secret.repo import (
     get_commits_by_batch,
@@ -416,7 +417,7 @@ def _batch_with_secret(sha: str) -> SecretScanCollection:
     commit_scan = SecretScanCollection(
         id=sha, type="commit", results=Results(results=[result], errors=[])
     )
-    return SecretScanCollection(id="batch", type="commit-range", scans=[commit_scan])
+    return SecretScanCollection(id="batch", type="commit-ranges", scans=[commit_scan])
 
 
 def _scan_commit_range_of_batches(
@@ -424,6 +425,7 @@ def _scan_commit_range_of_batches(
     from_sha_mock,
     batches,
     started_together: Optional[threading.Barrier] = None,
+    secret_config: Optional[SecretConfig] = None,
 ):
     """
     Scan one commit per batch, scan_commits_content answering batch i with
@@ -447,12 +449,19 @@ def _scan_commit_range_of_batches(
     )
     client = MagicMock()
     client.secret_scan_preferences.maximum_documents_per_scan = 1
+    config = secret_config or SecretConfig()
     output_handler = MagicMock()
-    output_handler.process_scan.side_effect = lambda collection: (
-        ExitCode.SCAN_FOUND_PROBLEMS
-        if collection.total_secrets_count
-        else ExitCode.SUCCESS
-    )
+
+    def process_scan(collection):
+        # Mirror SecretOutputHandler._get_exit_code: only secrets fail when
+        # fail-open is enabled; unscanned content alone exits 0 in that mode
+        if collection.total_secrets_count:
+            return ExitCode.SCAN_FOUND_PROBLEMS
+        if collection.has_errors and config.fail_on_server_error:
+            return ExitCode.SCAN_FOUND_PROBLEMS
+        return ExitCode.SUCCESS
+
+    output_handler.process_scan.side_effect = process_scan
 
     exit_code = scan_commit_range(
         client=client,
@@ -461,7 +470,7 @@ def _scan_commit_range_of_batches(
         output_handler=output_handler,
         exclusion_regexes=set(),
         scan_context=ScanContext(scan_mode=ScanMode.PRE_RECEIVE, command_path="x"),
-        secret_config=SecretConfig(),
+        secret_config=config,
     )
     return exit_code, output_handler.process_scan.call_args.args[0]
 
@@ -471,27 +480,56 @@ def _scan_commit_range_of_batches(
 @patch("ggshield.verticals.secret.repo.check_client_api_key")
 @patch("ggshield.verticals.secret.repo.Commit.from_sha")
 @patch("ggshield.verticals.secret.repo.scan_commits_content")
-def test_scan_commit_range_reports_secrets_found_before_a_failed_batch(
+def test_scan_commit_range_failed_batch_raises_by_default(
     scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes
 ):
     """
     GIVEN a batch with a secret, then a batch the API did not scan
-    WHEN scanning the commit range
-    THEN the secret is reported and the command fails with exit code 1
-    AND the failure is part of the report
+    WHEN scanning the commit range with the default fail-on behavior
+    THEN the failure propagates instead of being turned into a clean report
     """
+    with pytest.raises(ServiceUnavailableError, match="throttled"):
+        _scan_commit_range_of_batches(
+            scan_commits_content_mock,
+            from_sha_mock,
+            [_batch_with_secret("0"), ServiceUnavailableError("throttled")],
+        )
+
+
+@patch("ggshield.verticals.secret.repo.MAX_WORKERS", 1)
+@patch("ggshield.verticals.secret.repo.get_required_token_scopes_from_config")
+@patch("ggshield.verticals.secret.repo.check_client_api_key")
+@patch("ggshield.verticals.secret.repo.Commit.from_sha")
+@patch("ggshield.verticals.secret.repo.scan_commits_content")
+def test_scan_commit_range_fail_open_lists_unscanned_commits(
+    scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes
+):
+    """
+    GIVEN a batch with a secret, then a batch the API did not scan
+    WHEN scanning with --no-fail-on-server-error
+    THEN every commit is present, the failed one listing its file as unscanned
+    AND the secrets of the first batch are kept
+    """
+    secret_config = SecretConfig(fail_on_server_error=False)
     exit_code, collection = _scan_commit_range_of_batches(
         scan_commits_content_mock,
         from_sha_mock,
         [_batch_with_secret("0"), ServiceUnavailableError("throttled")],
+        secret_config=secret_config,
     )
 
+    # The secret still fails the command even in fail-open mode
     assert exit_code == ExitCode.SCAN_FOUND_PROBLEMS
     assert collection.total_secrets_count > 0
-    assert collection.results is not None
-    assert [
-        "throttled" in error.description for error in collection.results.errors
-    ] == [True]
+    # Both commits are present, the failed one did not vanish
+    assert [scan.id for scan in collection.scans] == ["0", "1"]
+    failed_scan = collection.scans[1]
+    assert failed_scan.results is not None
+    assert len(failed_scan.results.errors) == 1
+    error = failed_scan.results.errors[0]
+    assert "throttled" in error.description
+    assert error.files == [("commit://1/f", Filemode.UNKNOWN)]
+    assert not failed_scan.results.results
 
 
 @pytest.mark.parametrize("forbidden_first", [True, False])

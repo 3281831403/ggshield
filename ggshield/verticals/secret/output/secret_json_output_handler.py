@@ -48,7 +48,7 @@ class SecretJSONOutputHandler(SecretOutputHandler):
                 scan_dict.setdefault("errors", []).append(error_dict)
 
         if scan.scans:
-            for inner_scan in scan.scans_with_results:
+            for inner_scan in scan.scans:
                 inner_scan_dict = self.create_scan_dict(
                     inner_scan, top=False, incident_details=incident_details
                 )

@@ -17,6 +17,7 @@ from ggshield.core.text_utils import (
 
 from ..extended_match import ExtendedMatch
 from ..secret_scan_collection import (
+    Error,
     IgnoreKind,
     Result,
     Secret,
@@ -67,7 +68,7 @@ class SecretTextOutputHandler(SecretOutputHandler):
         if self.verbose:
             scan_buf.write(secrets_engine_version())
         scan_buf.write(processed_scan_results)
-        if not processed_scan_results:
+        if not processed_scan_results and not scan.has_errors:
 
             scan_buf.write(
                 no_new_leak_message()
@@ -98,10 +99,11 @@ class SecretTextOutputHandler(SecretOutputHandler):
             current_result_string = current_result_buf.getvalue()
 
             # We want to show header when at least one result is not empty
-            if scan.optional_header and current_result_string:
+            if scan.optional_header and (current_result_string or scan.results.errors):
                 results_buf.write(scan.optional_header)
 
             results_buf.write(current_result_string)
+            results_buf.write(self.process_errors(scan.results.errors))
 
         if scan.scans:
             for sub_scan in scan.scans:
@@ -109,6 +111,15 @@ class SecretTextOutputHandler(SecretOutputHandler):
                 results_buf.write(inner_scan_str)
 
         return results_buf.getvalue()
+
+    def process_errors(self, errors: List[Error]) -> str:
+        """Render the unscanned files, grouped by failure message."""
+        buf = StringIO()
+        for error in errors:
+            buf.write(f"\n{error.description}\n")
+            for filename, _filemode in error.files:
+                buf.write(f"- {filename}\n")
+        return buf.getvalue()
 
     def process_result(self, result: Result) -> str:
         """

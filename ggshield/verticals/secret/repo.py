@@ -2,10 +2,10 @@ import itertools
 import logging
 import traceback
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from re import Pattern
-from typing import Callable, List, Set
+from typing import Callable, List, Set, Tuple
 
 from click import ClickException, UsageError
 from pygitguardian import GGClient
@@ -16,11 +16,17 @@ from ggshield.core.client import check_client_api_key
 from ggshield.core.config import Config
 from ggshield.core.config.user_config import SecretConfig
 from ggshield.core.constants import MAX_WORKERS
-from ggshield.core.errors import ExitCode, UnexpectedError, handle_exception
+from ggshield.core.errors import (
+    ExitCode,
+    ServiceUnavailableError,
+    UnexpectedError,
+    handle_exception,
+)
 from ggshield.core.scan import Commit, ScanContext
+from ggshield.core.scan.commit_utils import CommitScannable
 from ggshield.core.scanner_ui import create_message_only_scanner_ui
 from ggshield.core.text_utils import STYLE, format_text
-from ggshield.utils.git_shell import get_list_commit_SHA, is_git_dir
+from ggshield.utils.git_shell import Filemode, get_list_commit_SHA, is_git_dir
 from ggshield.utils.os import cd
 from ggshield.verticals.secret.secret_scanner import (
     get_required_token_scopes_from_config,
@@ -28,7 +34,7 @@ from ggshield.verticals.secret.secret_scanner import (
 )
 
 from .output import SecretOutputHandler
-from .secret_scan_collection import Results, SecretScanCollection
+from .secret_scan_collection import Error, Results, SecretScanCollection
 from .secret_scanner import SecretScanner
 
 
@@ -66,6 +72,46 @@ def scan_repo_path(
         return handle_exception(error)
 
 
+def _commit_scan_error(commit: Commit, description: str) -> Error:
+    """
+    Build an Error listing every file of `commit` as unscanned. Used for batches
+    the API did not answer or that never ran, so the commit still appears in the
+    report instead of silently dropping out of it.
+    """
+    files = [
+        (CommitScannable.create_url(commit.sha, path), Filemode.UNKNOWN)
+        for path in commit.info.paths
+    ]
+    return Error(files=files, description=description)
+
+
+def _commit_collection(
+    commit: Commit,
+    results_for_commit_files: list,
+    errors: List[Error],
+) -> SecretScanCollection:
+    optional_header = (
+        format_text(f"\ncommit {commit.sha}\n", STYLE["commit_info"])
+        + f"Author: {commit.info.author} <{commit.info.email}>\n"
+        + f"Date: {commit.info.date}\n"
+    )
+
+    return SecretScanCollection(
+        commit.sha or "unknown",
+        type="commit",
+        results=Results(
+            results=results_for_commit_files,
+            errors=errors,
+        ),
+        optional_header=optional_header,
+        extra_info={
+            "author": commit.info.author,
+            "email": commit.info.email,
+            "date": commit.info.date,
+        },
+    )
+
+
 def scan_commits_content(
     commits: List[Commit],
     client: GGClient,
@@ -74,6 +120,7 @@ def scan_commits_content(
     secret_config: SecretConfig,
     progress_callback: Callable[[int], None],
     commit_scanned_callback: Callable[[Commit], None],
+    raise_on_failure: bool = True,
 ) -> SecretScanCollection:  # pragma: no cover
     try:
         commit_files = itertools.chain.from_iterable(c.get_files() for c in commits)
@@ -86,8 +133,13 @@ def scan_commits_content(
             secret_config=secret_config,
         )
         with create_message_only_scanner_ui() as scanner_ui:
+            # In fail-open mode failures are collected so every commit of the
+            # batch ends up either scanned or listed as unscanned
             results = scanner.scan(
-                commit_files, scan_threads=SCAN_THREADS, scanner_ui=scanner_ui
+                commit_files,
+                scan_threads=SCAN_THREADS,
+                scanner_ui=scanner_ui,
+                raise_on_failure=raise_on_failure,
             )
     except ClickException:
         # scan_commit_range decides whether a failed batch fails the command
@@ -107,32 +159,25 @@ def scan_commits_content(
             commit_scanned_callback(commit)
 
     result_for_urls = {result.url: result for result in results.results}
+    # Map each error back to the commits whose files it lists, so a single chunk
+    # failure is reported once instead of being duplicated on every commit
+    urls_to_commits = {url: commit for commit in commits for url in commit.urls}
+    errors_by_commit = {id(commit): [] for commit in commits}
+    for error in results.errors:
+        affected = {urls_to_commits[filename] for filename, _ in error.files}
+        for commit in affected:
+            errors_by_commit[id(commit)].append(error)
+
     scans = []
     for commit in commits:
         results_for_commit_files = [
             result_for_urls[u] for u in commit.urls if u in result_for_urls
         ]
-
-        optional_header = (
-            format_text(f"\ncommit {commit.sha}\n", STYLE["commit_info"])
-            + f"Author: {commit.info.author} <{commit.info.email}>\n"
-            + f"Date: {commit.info.date}\n"
-        )
-
         scans.append(
-            SecretScanCollection(
-                commit.sha or "unknown",
-                type="commit",
-                results=Results(
-                    results=results_for_commit_files,
-                    errors=results.errors,
-                ),
-                optional_header=optional_header,
-                extra_info={
-                    "author": commit.info.author,
-                    "email": commit.info.email,
-                    "date": commit.info.date,
-                },
+            _commit_collection(
+                commit,
+                results_for_commit_files,
+                errors_by_commit[id(commit)],
             )
         )
 
@@ -200,7 +245,6 @@ def scan_commit_range(
             commits=itertools.chain(*commits_iters),
             batch_max_size=max_documents,
         )
-        scans: List[SecretScanCollection] = []
 
         def commit_scanned_callback(commit: Commit):
             if include_staged and commit.sha is None:
@@ -208,48 +252,121 @@ def scan_commit_range(
             else:
                 ui.display_verbose(f"Scanned {commit.sha}")
 
+        # Remember the commits of every batch: when a batch fails or is
+        # cancelled, they still have to be listed as unscanned in the report
+        future_commits: List[Tuple[Future, List[Commit]]] = []
+        # --no-fail-on-server-error switches scanning to collect mode: chunk
+        # failures become report errors instead of aborting the batch
+        raise_on_failure = secret_config.fail_on_server_error
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
             for commits in commits_batch:
-                futures.append(
-                    executor.submit(
-                        scan_commits_content,
-                        commits,
-                        client,
-                        cache,
-                        scan_context,
-                        secret_config,
-                        progress.advance,
-                        commit_scanned_callback,
-                    )
+                future = executor.submit(
+                    scan_commits_content,
+                    commits,
+                    client,
+                    cache,
+                    scan_context,
+                    secret_config,
+                    progress.advance,
+                    commit_scanned_callback,
+                    raise_on_failure,
                 )
+                future_commits.append((future, commits))
 
-            failures: List[ClickException] = []
+            scans: List[SecretScanCollection] = []
+            batch_failures: List[ClickException] = []
             try:
                 # in submission order so we preserve the order
-                for future in futures:
+                for future, commits in future_commits:
                     if future.cancelled():
+                        # The batch never ran because another one failed
+                        cancellation = ServiceUnavailableError(
+                            "Scanning failed: the batch was cancelled after"
+                            " another batch failed."
+                        )
+                        if _fail_open_allows(secret_config, cancellation):
+                            scans.extend(
+                                _unscanned_batch_collections(commits, cancellation)
+                            )
+                            continue
+                        batch_failures.append(cancellation)
                         continue
                     try:
                         scan_collection = future.result()
                     except ClickException as exc:
-                        # Don't run the remaining batches, but keep what the
-                        # running ones find
-                        failures.append(exc)
+                        # In fail-open mode, skippable failures keep every
+                        # commit in the report, listed as unscanned, and exit 0.
+                        # Other failures stop the remaining batches: the one
+                        # that cannot be skipped must win, whatever the
+                        # completion order.
+                        if _fail_open_allows(secret_config, exc):
+                            executor.shutdown(cancel_futures=True)
+                            scans.extend(_unscanned_batch_collections(commits, exc))
+                            continue
                         executor.shutdown(cancel_futures=True)
+                        batch_failures.append(exc)
                         continue
-                    scans.extend(scan_collection.scans_with_results)
+                    scans.extend(scan_collection.scans)
             except Exception:
                 # Don't run the remaining batches if one already failed
                 executor.shutdown(cancel_futures=True)
                 raise
 
+            if batch_failures:
+                raise next(
+                    (
+                        failure
+                        for failure in batch_failures
+                        if not isinstance(failure, ServiceUnavailableError)
+                    ),
+                    batch_failures[0],
+                )
+
     collection = SecretScanCollection(
         id=scan_context.command_id, type="commit-range", scans=scans
     )
-    error = report_scan_failures(
-        failures, found_secrets=collection.total_secrets_count > 0
-    )
-    if error is not None:
-        collection.results = Results(errors=[error])
+    _dedupe_collection_errors(collection)
     return output_handler.process_scan(collection)
+
+
+def _fail_open_allows(secret_config: SecretConfig, exc: ClickException) -> bool:
+    """
+    Whether `--no-fail-on-server-error` lets this failure through. Only a
+    skippable server unavailability can be skipped; every other failure still
+    aborts the command.
+    """
+    return (
+        isinstance(exc, ServiceUnavailableError)
+        and not secret_config.fail_on_server_error
+    )
+
+
+def _dedupe_collection_errors(collection: SecretScanCollection) -> None:
+    """
+    The same chunk failure is mapped onto each commit whose files it contains:
+    collapse it to a single Error per commit and drop errors that no longer name
+    any file of that commit.
+    """
+    for scan in collection.scans or []:
+        if scan.results is None:
+            continue
+        scan.results.errors = report_scan_failures(scan.results.errors)
+
+
+def _unscanned_batch_collections(
+    commits: List[Commit], failure: ClickException
+) -> List[SecretScanCollection]:
+    """
+    Build commit collections for batches the API did not answer: every commit of
+    the batch is reported, with all its files listed as unscanned, instead of
+    disappearing from the report.
+    """
+    description = f"Some files were not scanned: {failure.format_message()}"
+    return [
+        _commit_collection(
+            commit,
+            results_for_commit_files=[],
+            errors=[_commit_scan_error(commit, description)],
+        )
+        for commit in commits
+    ]

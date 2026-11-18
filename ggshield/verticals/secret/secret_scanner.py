@@ -6,7 +6,7 @@ import logging
 import os
 from ast import literal_eval
 from concurrent.futures import Future
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import click
 import requests
@@ -28,6 +28,7 @@ from ggshield.core.scan import DecodeError, ScanContext, Scannable
 from ggshield.core.scan.scannable import NonSeekableFileError
 from ggshield.core.scanner_ui.scanner_ui import ScannerUI
 from ggshield.core.text_utils import pluralize
+from ggshield.utils.git_shell import Filemode
 
 from .secret_scan_collection import Error, Result, Results
 
@@ -74,12 +75,18 @@ class SecretScanner:
         files: Iterable[Scannable],
         scanner_ui: ScannerUI,
         scan_threads: Optional[int] = None,
+        raise_on_failure: bool = True,
     ) -> Results:
         """
         Starts the scan, using at most `scan_threads`. If `scan_threads` is not set,
         defaults to MAX_WORKERS.
         Reports progress through `scanner_ui`.
         Returns a Results instance.
+
+        By default a chunk the API did not scan raises, so the command fails
+        fast instead of reporting unscanned content as clean. Historical scans
+        pass `raise_on_failure=False`: every failure is then returned as an
+        Error naming the unscanned files, and the caller accounts for them.
         """
         if scan_threads is None:
             scan_threads = MAX_WORKERS
@@ -94,7 +101,9 @@ class SecretScanner:
                 scanner_ui,
             )
 
-            return self._collect_results(scanner_ui, chunks_for_futures)
+            return self._collect_results(
+                scanner_ui, chunks_for_futures, raise_on_failure
+            )
 
     def _document_filename(self, scannable: Scannable) -> str:
         """
@@ -222,6 +231,7 @@ class SecretScanner:
         self,
         scanner_ui: ScannerUI,
         chunks_for_futures: Dict[ScanFuture, List[Scannable]],
+        raise_on_failure: bool,
     ) -> Results:
         """
         Receive scans as they complete, report progress and collect them and return
@@ -230,17 +240,28 @@ class SecretScanner:
         self.cache.purge()
 
         results = []
+        errors: List[Error] = []
         failures: List[click.ClickException] = []
         for future in concurrent.futures.as_completed(chunks_for_futures):
             chunk = chunks_for_futures[future]
             scanner_ui.on_scanned(chunk)
 
             try:
-                scan = _get_chunk_scan(future, chunk)
+                scan, scan_error = _get_chunk_scan(future, chunk)
             except click.ClickException as exc:
-                # Collect every chunk: raising early drops the secrets found so far
-                failures.append(exc)
+                if raise_on_failure or not isinstance(exc, ServiceUnavailableError):
+                    # In fail-fast mode any failure aborts. In collect mode
+                    # (--no-fail-on-server-error) only a skippable server
+                    # failure becomes a report error: anything else, e.g. a
+                    # quota limit, must still abort the command.
+                    failures.append(exc)
+                    continue
+                errors.append(_chunk_scan_error(exc, chunk))
                 continue
+            if scan_error is not None:
+                # A 400 faults the chunk's files without raising: record them so
+                # they are reported as unscanned instead of vanishing
+                errors.append(scan_error)
             if scan is None:
                 continue
 
@@ -254,41 +275,61 @@ class SecretScanner:
                     )
                 results.append(result)
 
+        if failures:
+            # Prefer a failure --no-fail-on-server-error cannot skip, so a quota
+            # error running next to a throttled chunk always wins
+            raise next(
+                (
+                    failure
+                    for failure in failures
+                    if not isinstance(failure, ServiceUnavailableError)
+                ),
+                failures[0],
+            )
+
         self.cache.save()
-        collected = Results(results=results)
-        error = report_scan_failures(failures, found_secrets=collected.has_secrets)
-        if error is not None:
-            collected.errors.append(error)
-        return collected
+        return Results(results=results, errors=errors)
 
 
-def report_scan_failures(
-    failures: List[click.ClickException], found_secrets: bool
-) -> Optional[Error]:
+def _chunk_scan_error(exc: click.ClickException, chunk: List[Scannable]) -> Error:
     """
-    Raise the failure to report, preferring one --no-fail-on-server-error cannot
-    skip. If secrets were found, they already fail the command: display the failure
-    and return it as an Error to report next to them instead.
+    Build the Error describing a chunk the API did not scan, naming every file
+    of the chunk so reports can list them as unscanned.
     """
-    if not failures:
-        return None
-    failure = next(
-        (f for f in failures if not isinstance(f, ServiceUnavailableError)),
-        failures[-1],
+    return Error(
+        files=[(file.filename, file.filemode) for file in chunk],
+        description=f"Some files were not scanned: {exc.format_message()}",
     )
-    if not found_secrets:
-        raise failure
-    description = f"Some files were not scanned: {failure.format_message()}"
-    ui.display_error(description)
-    return Error(files=[], description=description)
+
+
+def report_scan_failures(errors: List[Error]) -> List[Error]:
+    """
+    Merge the errors collected while scanning: a given failure message is
+    reported only once, but the files of every chunk it hit are kept together.
+    Errors stay ordered by their first occurrence.
+    """
+    merged: Dict[str, Error] = {}
+    order: List[str] = []
+    for error in errors:
+        existing = merged.get(error.description)
+        if existing is None:
+            merged[error.description] = Error(
+                files=list(error.files), description=error.description
+            )
+            order.append(error.description)
+        else:
+            known = {file for file in existing.files}
+            existing.files.extend(file for file in error.files if file not in known)
+    return [merged[description] for description in order]
 
 
 def _get_chunk_scan(
     future: ScanFuture, chunk: List[Scannable]
-) -> Optional[MultiScanResult]:
+) -> Tuple[Optional[MultiScanResult], Optional[Error]]:
     """
-    Return the scan of `chunk`, or None if the API rejected its files. Raise if the
-    API did not scan it.
+    Return the scan of `chunk` and, when the API rejected some of its files with
+    a 400, the Error listing the unscanned files. Raise when the API did not scan
+    the chunk at all.
     """
     exception = future.exception()
     if exception is not None:
@@ -316,10 +357,41 @@ def _get_chunk_scan(
             # py-gitguardian only reads a result sent as exactly "application/json":
             # this one may hold a secret, so --no-fail-on-server-error must not skip it
             raise UnexpectedError("Could not read the scan result sent by GitGuardian.")
+        if scan.status_code == 400:
+            handle_scan_chunk_error(scan, chunk)
+            return None, Error(
+                files=_faulty_400_files(scan, chunk),
+                description=(
+                    "Some files were not scanned: the API rejected the request"
+                    f" ({describe_http_error(scan)})."
+                ),
+            )
         handle_scan_chunk_error(scan, chunk)
-        return None
+        return None, None
     assert isinstance(scan, MultiScanResult)
-    return scan
+    return scan, None
+
+
+def _faulty_400_files(
+    detail: Detail, chunk: List[Scannable]
+) -> List[Tuple[str, Filemode]]:
+    """
+    Extract the files a 400 response rejects one by one from its per-file detail
+    list. Empty entries mean the API accepted the file at that index. When the
+    body is not a per-file list, every file of the chunk is affected.
+    """
+    try:
+        details = literal_eval(detail.detail)
+    except Exception:
+        details = None
+
+    if isinstance(details, list) and len(details) == len(chunk):
+        return [
+            (file.filename, file.filemode)
+            for file, inner_detail in zip(chunk, details)
+            if inner_detail
+        ]
+    return [(file.filename, file.filemode) for file in chunk]
 
 
 def handle_scan_chunk_error(detail: Detail, chunk: List[Scannable]) -> None:
@@ -364,7 +436,6 @@ def handle_scan_chunk_error(detail: Detail, chunk: List[Scannable]) -> None:
         for i, inner_detail in enumerate(details):
             if inner_detail:
                 ui.display_error(f"- {chunk[i].filename}: {str(inner_detail)}")
-        return
     else:
         # if the details had a request error
         filenames = "\n".join(f"- {file.filename}" for file in chunk)

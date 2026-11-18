@@ -9,7 +9,7 @@ from ggshield.core.match_span import MatchSpan
 from ggshield.core.text_utils import pluralize
 
 from ..extended_match import ExtendedMatch
-from ..secret_scan_collection import Result, Secret, SecretScanCollection
+from ..secret_scan_collection import Error, Result, Secret, SecretScanCollection
 from .secret_output_handler import SecretOutputHandler
 
 
@@ -24,32 +24,56 @@ class SecretSARIFOutputHandler(SecretOutputHandler):
             if self.with_incident_details and self.client
             else {}
         )
+        run: Dict[str, Any] = {
+            "tool": {
+                "driver": {
+                    "organization": "GitGuardian",
+                    "name": "ggshield",
+                    "informationUri": "https://github.com/GitGuardian/ggshield",
+                    "version": ggshield_version,
+                },
+                "extensions": [
+                    {
+                        "name": "secret",
+                        "version": VERSIONS.secrets_engine_version,
+                    }
+                ],
+            },
+            "results": list(
+                _create_sarif_results(scan.get_all_results(), incident_details)
+            ),
+        }
+        notifications = list(_create_sarif_notifications(scan.get_all_errors()))
+        if notifications:
+            # toolExecutionNotifications is how SARIF reports content the tool
+            # could not analyze, so an unscanned commit never looks clean
+            run["toolExecutionNotifications"] = notifications
         dct = {
             "version": "2.1.0",
             "$schema": SCHEMA_URL,
-            "runs": [
-                {
-                    "tool": {
-                        "driver": {
-                            "organization": "GitGuardian",
-                            "name": "ggshield",
-                            "informationUri": "https://github.com/GitGuardian/ggshield",
-                            "version": ggshield_version,
-                        },
-                        "extensions": [
-                            {
-                                "name": "secret",
-                                "version": VERSIONS.secrets_engine_version,
-                            }
-                        ],
-                    },
-                    "results": list(
-                        _create_sarif_results(scan.get_all_results(), incident_details)
-                    ),
-                }
-            ],
+            "runs": [run],
         }
         return json.dumps(dct)
+
+
+def _create_sarif_notifications(errors: Iterable[Error]) -> Iterable[Dict[str, Any]]:
+    """
+    Create one SARIF tool execution notification per unscanned file, keeping the
+    failure description in the message.
+    """
+    for error in errors:
+        for filename, _filemode in error.files:
+            yield {
+                "level": "error",
+                "message": {"text": error.description},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": filename},
+                        }
+                    }
+                ],
+            }
 
 
 def _create_sarif_results(
