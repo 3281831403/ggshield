@@ -31,6 +31,33 @@ pub const DEFAULT_API_TIMEOUT: u64 = 60;
 pub const MIN_API_TIMEOUT: u64 = 1;
 pub const MAX_API_TIMEOUT: u64 = 3600;
 
+pub const FAIL_ON_AI_HOOK_ERROR_ENV_VAR: &str = "GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR";
+
+/// `resolve_fail_on_ai_hook_error()`: the variable wins over the file, read with
+/// the values click accepts for `GITGUARDIAN_FAIL_ON_SERVER_ERROR`. An unusable
+/// one is ignored, with the warning to print: click's usage error exits 2, which
+/// agents read as a block.
+pub fn resolve_fail_on_ai_hook_error(
+    from_env: Option<&str>,
+    configured: bool,
+) -> (bool, Option<String>) {
+    let raw = from_env.unwrap_or_default();
+    if raw.is_empty() {
+        return (configured, None);
+    }
+    match raw.trim().to_lowercase().as_str() {
+        "1" | "true" | "t" | "yes" | "y" | "on" => (true, None),
+        "" | "0" | "false" | "f" | "no" | "n" | "off" => (false, None),
+        _ => (
+            configured,
+            Some(format!(
+                "Ignoring {FAIL_ON_AI_HOOK_ERROR_ENV_VAR}='{raw}': it must be a boolean \
+                 (true/false)."
+            )),
+        ),
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SecretConfig {
     /// Each entry is either the sha256 "ignore sha" of a policy break or a
@@ -591,6 +618,38 @@ mod tests {
             assert!(
                 matches!(of(&yaml), Err(Error::Fatal(_))),
                 "{bad} must be fatal"
+            );
+        }
+    }
+
+    /// GIVEN `GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR` unset, empty, any of the values
+    /// click accepts for a boolean, or something else
+    /// WHEN it is resolved against the file's value
+    /// THEN unset and empty keep the file's value, click's values win in any
+    /// case and with surrounding spaces, and anything else keeps the file's value
+    /// with a warning.
+    #[test]
+    fn the_fail_on_ai_hook_error_variable_overrides_the_file() {
+        let resolve = resolve_fail_on_ai_hook_error;
+        assert_eq!(resolve(None, true), (true, None));
+        assert_eq!(resolve(Some(""), true), (true, None));
+        for value in ["1", "true", "t", "yes", "y", "on", " TRUE ", "Yes"] {
+            assert_eq!(resolve(Some(value), false), (true, None), "{value:?}");
+        }
+        for value in ["0", "false", "f", "no", "n", "off", " ", "OFF"] {
+            assert_eq!(resolve(Some(value), true), (false, None), "{value:?}");
+        }
+        for configured in [false, true] {
+            assert_eq!(
+                resolve(Some("block"), configured),
+                (
+                    configured,
+                    Some(
+                        "Ignoring GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR='block': it must be a \
+                         boolean (true/false)."
+                            .to_string()
+                    )
+                )
             );
         }
     }

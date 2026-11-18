@@ -6,6 +6,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
 
 import filelock
@@ -41,6 +42,41 @@ from .models import (
 )
 
 
+FAIL_ON_AI_HOOK_ERROR_ENV_VAR = "GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR"
+# click's BoolParamType, which reads GITGUARDIAN_FAIL_ON_SERVER_ERROR.
+_TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_VALUES = {"", "0", "false", "f", "no", "n", "off"}
+
+
+class UnrecognizedAgentError(ValueError):
+    """No known agent sent this payload, so no agent-shaped answer can be written."""
+
+    def __init__(self) -> None:
+        super().__init__("Unrecognized agent")
+
+
+def resolve_fail_on_ai_hook_error(configured: bool) -> bool:
+    """`secret.fail_on_ai_hook_error`, overridden by GITGUARDIAN_FAIL_ON_AI_HOOK_ERROR.
+
+    Read with the values click accepts for GITGUARDIAN_FAIL_ON_SERVER_ERROR, but
+    an unusable value is ignored with a warning: click's usage error exits 2,
+    which agents read as a block.
+    """
+    raw = os.getenv(FAIL_ON_AI_HOOK_ERROR_ENV_VAR, "")
+    if not raw:
+        return configured
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    ui.display_warning(
+        f"Ignoring {FAIL_ON_AI_HOOK_ERROR_ENV_VAR}='{raw}': it must be a boolean"
+        " (true/false)."
+    )
+    return configured
+
+
 HOOK_NAME_TO_EVENT_TYPE = {
     "userpromptsubmit": EventType.USER_PROMPT,
     "userpromptsubmitted": EventType.USER_PROMPT,  # Copilot CLI's native event name
@@ -63,14 +99,22 @@ TOOL_NAME_TO_TOOL = {
 }
 
 
+def _debounce_path() -> Path:
+    return get_cache_dir() / "latest_ai_hook.txt"
+
+
+def _payload_hash(content: str) -> str:
+    return hashlib.sha256(content.strip().encode()).hexdigest()
+
+
 def has_already_been_seen(content: str) -> bool:
     """Return True if the payload is identical to the most recent hook call.
 
     Some agents install hooks from multiple assistants, which can invoke ggshield
     twice with the same payload.
     """
-    payload_hash = hashlib.sha256(content.strip().encode()).hexdigest()
-    debounce_path = get_cache_dir() / "latest_ai_hook.txt"
+    payload_hash = _payload_hash(content)
+    debounce_path = _debounce_path()
     try:
         debounce_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -87,6 +131,21 @@ def has_already_been_seen(content: str) -> bool:
             return True
         debounce_path.write_text(payload_hash)
         return False
+
+
+def forget_seen(content: str) -> None:
+    """Undo has_already_been_seen() for a payload that was never scanned.
+
+    Otherwise an identical retry is answered as a duplicate, exit 0 and no
+    output, which lets through what `fail_on_ai_hook_error` just denied.
+    """
+    debounce_path = _debounce_path()
+    try:
+        with filelock.FileLock(debounce_path.with_suffix(".lock")):
+            if debounce_path.read_text() == _payload_hash(content):
+                debounce_path.unlink()
+    except OSError:
+        pass
 
 
 def lookup(data: Dict[str, Any], keys: Sequence[str], default: Any = None) -> Any:
@@ -257,29 +316,43 @@ def parse_hook_input(raw_content: str) -> list[HookPayload]:
     return payloads
 
 
-def emit_fail_open_response(stdin_content: str, error: Exception) -> int:
-    """Emit an "allow" response carrying a warning instead of crashing.
+def emit_cannot_scan_response(stdin_content: str, error: Exception, fail: bool) -> int:
+    """Answer an event the hook could not scan, as `secret.fail_on_ai_hook_error` says.
 
-    A failure to scan (missing or unreadable token, unreachable server...)
-    must never break the agent: agents interpret a non-zero exit or a raw
-    traceback as a block or an error, and the user is never told that
-    scanning is broken. Instead we allow the action and surface a warning
-    through the agent.
+    A failure to scan (unrecognized agent, missing or unreadable token,
+    unreachable server...) must never crash the hook: agents treat a raw
+    traceback or a bare non-zero exit inconsistently, some blocking every
+    action and others running it with no notice. A known agent shows the
+    warning to the user; for an unrecognized agent it goes to stderr only,
+    which most agents do not display on a successful hook.
 
     Returns the exit code to use.
     """
-    warning = _cannot_scan_warning(error)
-    ui.display_warning(warning)
     try:
         payload = parse_hook_input(stdin_content)[-1]
+    except UnrecognizedAgentError as e:
+        # Even with a working token this event could not be scanned.
+        warning = _cannot_scan_warning(e)
+        ui.display_warning(warning)
+        # The agent's response format is unknown: an empty stdout with exit 0
+        # is the most widely understood "allow", exit 2 the most common "block".
+        return 2 if fail else 0
     except Exception:
-        # We can't even tell which agent is calling us, so we can't emit a
-        # well-formed response. Agents treat exit 1 as a non-blocking error.
+        ui.display_warning(_cannot_scan_warning(error))
+        # Not a hook event at all. Agents treat exit 1 as a non-blocking error.
         return 1
+    warning = _cannot_scan_warning(error)
+    ui.display_warning(warning)
     return payload.agent.output_result(HookResult.allow_with_warning(payload, warning))
 
 
 def _cannot_scan_warning(error: Exception) -> str:
+    if isinstance(error, UnrecognizedAgentError):
+        return (
+            "ggshield does not recognize the AI agent that called it — this action "
+            "was NOT scanned for secrets. Update ggshield, as this agent may need a "
+            "newer version."
+        )
     cause = error.__cause__ if isinstance(error, AuthError) else None
     failure = cause.failure if isinstance(cause, KeystoreError) else None
     store = keystore_display_name()
@@ -328,7 +401,7 @@ def _detect_agent(data: Dict[str, Any]) -> Agent:
     for agent in AGENTS.values():
         if agent.is_caller(data):
             return agent
-    raise ValueError("Unrecognized agent")
+    raise UnrecognizedAgentError()
 
 
 def build_agent_headers(content: str) -> Dict[str, str]:
@@ -654,8 +727,12 @@ class AIHookScanner:
         if content.strip() and has_already_been_seen(content):
             return 0
 
-        payloads = parse_hook_input(content)
-        result = self._scan_payloads(payloads)
+        try:
+            payloads = parse_hook_input(content)
+            result = self._scan_payloads(payloads)
+        except Exception:
+            forget_seen(content)
+            raise
         payload = result.payload
 
         # Sometimes the secret has already leaked to the agent. Notify the user.
