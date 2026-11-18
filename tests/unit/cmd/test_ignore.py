@@ -1,5 +1,6 @@
 import os
 import tempfile
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pygitguardian.models import Match, PolicyBreak
@@ -8,20 +9,26 @@ from ggshield.__main__ import cli
 from ggshield.cmd.secret.ignore import ignore_last_found
 from ggshield.core.cache import Cache
 from ggshield.core.config import Config
+from ggshield.core.config.utils import get_global_path, load_yaml_dict
 from ggshield.core.errors import ExitCode
 from ggshield.core.filter import get_ignore_sha
 from ggshield.core.scan import Commit, ScanContext, ScanMode
 from ggshield.core.types import IgnoredMatch
+from ggshield.utils.os import cd
 from ggshield.verticals.secret import SecretScanner
+from tests.repository import Repository
 from tests.unit.conftest import (
     _MULTIPLE_SECRETS_PATCH,
     assert_invoke_exited_with,
     assert_invoke_ok,
     my_vcr,
+    write_yaml,
 )
 
 
 DOT_GITGUARDIAN_YAML = os.path.join(tempfile.gettempdir(), ".gitguardian.yml")
+
+SECRET_SHA = "41b8889e5e794b21cb1349d8eef1815960bf5257330fd40243a4895f26c2b5c8"
 
 FOUND_SECRETS = [
     IgnoredMatch(
@@ -255,3 +262,140 @@ def test_ignore_last_found_preserve_previous_config(client, isolated_fs):
     assert matches_ignore == found_secrets
     assert config.user_config.secret.ignored_paths == previous_paths
     assert config.user_config.exit_zero is True
+
+
+def test_ignore_sha_does_not_leak_global_config_into_local_config(cli_fs_runner):
+    """
+    GIVEN a global config containing user-specific settings
+    WHEN I ignore a secret sha
+    THEN the local config file only contains the new secret.ignored_matches entry
+    AND none of the global settings are copied into it
+    """
+    write_yaml(
+        get_global_path(".gitguardian.yaml"),
+        {
+            "version": 2,
+            "exit_zero": True,
+            "insecure": True,
+            "instance": "https://dashboard.gitguardian.com",
+            "secret": {"show_secrets": True},
+        },
+    )
+
+    cmd = ["secret", "ignore", SECRET_SHA, "--name", "test_name"]
+    result = cli_fs_runner.invoke(cli, cmd, color=False, catch_exceptions=False)
+
+    assert_invoke_ok(result)
+    assert load_yaml_dict(".gitguardian.yaml") == {
+        "version": 2,
+        "secret": {
+            "ignored_matches": [{"match": SECRET_SHA, "name": "test_name"}],
+        },
+    }
+
+
+def test_ignore_sha_twice_does_not_duplicate(cli_fs_runner):
+    """
+    GIVEN a secret sha already ignored
+    WHEN I ignore it again
+    THEN the local config file still contains a single entry for it
+    """
+    cmd = ["secret", "ignore", SECRET_SHA, "--name", "test_name"]
+    for _ in range(2):
+        result = cli_fs_runner.invoke(cli, cmd, color=False, catch_exceptions=False)
+        assert_invoke_ok(result)
+
+    dct = load_yaml_dict(".gitguardian.yaml")
+    assert dct["secret"]["ignored_matches"] == [
+        {"match": SECRET_SHA, "name": "test_name"}
+    ]
+
+
+def test_ignore_sha_preserves_existing_local_config(cli_fs_runner):
+    """
+    GIVEN a local config file with other settings
+    AND a global config already ignoring another secret
+    WHEN I ignore a secret sha
+    THEN the existing local settings are preserved
+    AND the globally ignored secret is not copied into the local file
+    """
+    write_yaml(
+        get_global_path(".gitguardian.yaml"),
+        {
+            "version": 2,
+            "exit_zero": True,
+            "secret": {
+                "ignored_matches": [{"match": "global_only_sha", "name": "global"}]
+            },
+        },
+    )
+    write_yaml(
+        ".gitguardian.yaml",
+        {
+            "version": 2,
+            "max_commits_for_hook": 25,
+            "secret": {"ignored_paths": ["tests/"]},
+        },
+    )
+
+    cmd = ["secret", "ignore", SECRET_SHA, "--name", "test_name"]
+    result = cli_fs_runner.invoke(cli, cmd, color=False, catch_exceptions=False)
+
+    assert_invoke_ok(result)
+    assert load_yaml_dict(".gitguardian.yaml") == {
+        "version": 2,
+        "max_commits_for_hook": 25,
+        "secret": {
+            "ignored_paths": ["tests/"],
+            "ignored_matches": [{"match": SECRET_SHA, "name": "test_name"}],
+        },
+    }
+
+
+def test_ignore_sha_names_existing_unnamed_entry(cli_fs_runner):
+    """
+    GIVEN a local config file already ignoring a sha, without a name
+    WHEN I ignore the same sha with a name
+    THEN the existing entry gets the name and is not duplicated
+    """
+    write_yaml(
+        ".gitguardian.yaml",
+        {
+            "version": 2,
+            "secret": {"ignored_matches": [{"match": SECRET_SHA}]},
+        },
+    )
+
+    cmd = ["secret", "ignore", SECRET_SHA, "--name", "test_name"]
+    result = cli_fs_runner.invoke(cli, cmd, color=False, catch_exceptions=False)
+
+    assert_invoke_ok(result)
+    dct = load_yaml_dict(".gitguardian.yaml")
+    assert dct["secret"]["ignored_matches"] == [
+        {"match": SECRET_SHA, "name": "test_name"}
+    ]
+
+
+def test_ignore_sha_from_subdirectory_writes_to_read_location(cli_fs_runner):
+    """
+    GIVEN a Git repository without any local config file
+    WHEN I ignore a secret sha from a subdirectory of the repository
+    THEN the local config file is created at the repository root, where
+    ggshield looks for it, and not in the subdirectory
+    """
+    repo = Repository.create(Path.cwd())
+    subdir = repo.path / "packages" / "api"
+    subdir.mkdir(parents=True)
+
+    with cd(str(subdir)):
+        cmd = ["secret", "ignore", SECRET_SHA, "--name", "test_name"]
+        result = cli_fs_runner.invoke(cli, cmd, color=False, catch_exceptions=False)
+
+    assert_invoke_ok(result)
+    assert not (subdir / ".gitguardian.yaml").exists()
+    assert load_yaml_dict(repo.path / ".gitguardian.yaml") == {
+        "version": 2,
+        "secret": {
+            "ignored_matches": [{"match": SECRET_SHA, "name": "test_name"}],
+        },
+    }

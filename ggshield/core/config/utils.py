@@ -110,7 +110,26 @@ def find_global_config_path(*, to_write: bool = False) -> Optional[Path]:
     return get_global_path(DEFAULT_CONFIG_FILENAME) if to_write else None
 
 
-def find_local_config_path() -> Optional[Path]:
+@overload
+def find_local_config_path(*, to_write: Literal[False] = False) -> Optional[Path]: ...
+
+
+@overload
+def find_local_config_path(*, to_write: Literal[True]) -> Path: ...
+
+
+def find_local_config_path(*, to_write: bool = False) -> Optional[Path]:
+    """
+    Returns the path to the local configuration file, that is the configuration
+    file located at the root of the current project (the directory ggshield
+    reads it from, even when invoked from a subdirectory).
+    If there is no such file:
+    - If `to_write` is False, returns None.
+    - If `to_write` is True, returns the path where it should be created, so
+      that a file written there is the one ggshield reads.
+
+    This means the function never returns None if `to_write` is True.
+    """
     try:
         project_root_dir = get_project_root_dir(Path())
     except GitExecutableNotFound:
@@ -119,7 +138,7 @@ def find_local_config_path() -> Optional[Path]:
         path = project_root_dir / filename
         if path.exists():
             return path
-    return None
+    return project_root_dir / DEFAULT_CONFIG_FILENAME if to_write else None
 
 
 def update_dict_from_other(dct: Dict[str, Any], other: Dict[str, Any]) -> None:

@@ -19,7 +19,7 @@ from ggshield.core.config.utils import (
     update_dict_from_other,
 )
 from ggshield.core.config.v1_config import convert_v1_config_dict
-from ggshield.core.constants import DEFAULT_API_TIMEOUT, DEFAULT_LOCAL_CONFIG_PATH
+from ggshield.core.constants import DEFAULT_API_TIMEOUT
 from ggshield.core.errors import ParseError, UnexpectedError, format_validation_error
 from ggshield.core.types import FilteredConfig, IgnoredMatch
 
@@ -174,7 +174,10 @@ class UserConfig(FilteredConfig):
         user_config.deprecation_messages = deprecation_messages
 
         if config_path is None:
-            config_path = Path(DEFAULT_LOCAL_CONFIG_PATH)
+            # No local configuration file: updates must be saved where ggshield
+            # looks for the local configuration (the project root), so that they
+            # are taken into account even when invoked from a subdirectory.
+            config_path = find_local_config_path(to_write=True)
         return user_config, config_path
 
     @staticmethod
@@ -191,6 +194,64 @@ class UserConfig(FilteredConfig):
 UserConfig.SCHEMA = marshmallow_dataclass.class_schema(UserConfig)(
     exclude=("deprecation_messages",)
 )
+
+
+def add_ignored_matches_to_config_file(
+    config_path: Path,
+    ignored_matches: List[IgnoredMatch],
+    known_match_shas: Set[str],
+) -> None:
+    """
+    Append `ignored_matches` to the `secret.ignored_matches` section of the
+    configuration file at `config_path`.
+
+    Unlike `UserConfig.save()`, this does not dump the whole merged
+    configuration: only the `secret.ignored_matches` section of the file is
+    touched, so settings coming from other configuration files (such as the
+    global configuration) are not copied into it.
+
+    - Matches already present in the file are not duplicated: their entry only
+      gets a name if they don't have one yet (mirrors
+      `SecretConfig.add_ignored_match()`).
+    - Matches listed in `known_match_shas` (matches already ignored through
+      another configuration file, e.g. the global one) are not added to the
+      file.
+
+    The file is only written if something changed. If the file uses a legacy
+    format, it is converted to the current one, like a regular load+save would.
+    """
+    dct = _load_config_dict(config_path, [])
+    secret_dct = dct.setdefault("secret", {})
+    entries = secret_dct.setdefault("ignored_matches", [])
+
+    entries_by_sha = {
+        entry["match"]: entry
+        for entry in entries
+        if isinstance(entry, dict) and "match" in entry
+    }
+
+    changed = False
+    for ignored_match in ignored_matches:
+        sha = ignored_match.match
+        existing_entry = entries_by_sha.get(sha)
+        if existing_entry is not None:
+            # Already in the file: take the opportunity to name it
+            if not existing_entry.get("name") and ignored_match.name:
+                existing_entry["name"] = ignored_match.name
+                changed = True
+        elif sha not in known_match_shas:
+            entry: Dict[str, Any] = {"match": sha}
+            if ignored_match.name:
+                entry["name"] = ignored_match.name
+            entries.append(entry)
+            entries_by_sha[sha] = entry
+            changed = True
+
+    if not changed:
+        return
+
+    dct["version"] = CURRENT_CONFIG_VERSION
+    save_yaml_dict(dct, config_path)
 
 
 def _load_config_dict(

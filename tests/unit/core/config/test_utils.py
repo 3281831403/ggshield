@@ -143,3 +143,20 @@ def test_find_config_in_root(tmp_path: Path):
 
     with cd(str(dir_path)):
         assert find_local_config_path() == config_path
+
+
+def test_find_config_to_write_in_root(tmp_path: Path):
+    """
+    GIVEN a repo without any config file and a subdirectory
+    WHEN looking for the local config path to write to, while inside the
+    subdirectory
+    THEN the returned path is the default config path at the root of the repo,
+    so that a file written there is the one ggshield reads
+    """
+    Repository.create(tmp_path)
+
+    dir_path = tmp_path / "dir"
+    dir_path.mkdir()
+
+    with cd(str(dir_path)):
+        assert find_local_config_path(to_write=True) == (tmp_path / ".gitguardian.yaml")
