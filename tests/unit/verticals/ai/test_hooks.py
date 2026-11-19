@@ -51,7 +51,7 @@ from ggshield.verticals.ai.hooks import (
 from ggshield.verticals.ai.mcp import send_mcp_activity
 from ggshield.verticals.ai.models import EventType, HookPayload, HookResult, Tool
 from ggshield.verticals.secret import SecretScanner
-from ggshield.verticals.secret.secret_scan_collection import IgnoreKind
+from ggshield.verticals.secret.secret_scan_collection import IgnoreKind, IgnoreReason
 from ggshield.verticals.secret.secret_scan_collection import Result as ScanResult
 from ggshield.verticals.secret.secret_scan_collection import Results, Secret
 from tests.conftest import skipwindows
@@ -123,6 +123,7 @@ def _make_secret(
     match_str: str = "***",
     known_secret: bool = False,
     incident_url: Optional[str] = None,
+    ignore_reason: Optional[IgnoreReason] = None,
 ):
     """Minimal Secret for tests; _message_from_secrets only uses
     detector_display_name, validity, matches[].match, matches[].match_type,
@@ -141,7 +142,7 @@ def _make_secret(
         known_secret=known_secret,
         incident_url=incident_url,
         matches=[mock_match],
-        ignore_reason=None,
+        ignore_reason=ignore_reason,
         diff_kind=None,
         is_vaulted=False,
         vault_type=None,
@@ -189,6 +190,32 @@ class TestAIHookScannerScanContent:
         assert "dummy-detector" in result.message
         assert "secret" in result.message.lower()
         assert "remove the secret from your prompt" in result.message
+
+    def test_ignored_secrets_kept_by_all_secrets_do_not_block(self):
+        """With all_secrets, ignored breaks stay in `secrets` for display: they
+        must not turn the verdict from allow into deny."""
+        mock_scanner = _mock_scanner([])
+        mock_scanner.secret_config = SecretConfig(all_secrets=True)
+        ignored = _make_secret(
+            "sk-ignored", ignore_reason=IgnoreReason(IgnoreKind.IGNORED_MATCH)
+        )
+        mock_scanner.scan.side_effect = lambda scannables, **kwargs: Results(
+            results=[
+                ScanResult(
+                    filename=list(scannables)[0].filename,
+                    filemode=Filemode.FILE,
+                    path=Path("."),
+                    url=list(scannables)[0].url,
+                    secrets=[ignored],
+                    ignored_secrets_count_by_kind=Counter(),
+                )
+            ],
+            errors=[],
+        )
+        hook_scanner = AIHookScanner(mock_scanner)
+        result = hook_scanner._scan_content(_dummy_payload())
+        assert result.block is False
+        assert result.nbr_secrets == 0
 
 
 class TestVerdictCacheShortCircuit:
@@ -281,6 +308,33 @@ class TestVerdictCacheShortCircuit:
         mock_scanner = _mock_scanner(
             [],
             ignored_secrets_count_by_kind=Counter({IgnoreKind.IGNORED_DETECTOR: 1}),
+        )
+        hook_scanner = AIHookScanner(mock_scanner)
+        assert hook_scanner._scan_content(self._payload()).block is False
+        assert not has_clean_verdict(self._key())
+        hook_scanner._scan_content(self._payload())
+        assert mock_scanner.scan.call_count == 2
+
+    def test_all_secrets_ignored_verdict_is_not_cached(self):
+        """Same as above, but with all_secrets moving the ignored break into
+        `secrets`: still an allow, still not a cacheable verdict."""
+        mock_scanner = _mock_scanner([])
+        mock_scanner.secret_config = SecretConfig(all_secrets=True)
+        ignored = _make_secret(
+            "sk-ignored", ignore_reason=IgnoreReason(IgnoreKind.IGNORED_MATCH)
+        )
+        mock_scanner.scan.side_effect = lambda scannables, **kwargs: Results(
+            results=[
+                ScanResult(
+                    filename=list(scannables)[0].filename,
+                    filemode=Filemode.FILE,
+                    path=Path("."),
+                    url=list(scannables)[0].url,
+                    secrets=[ignored],
+                    ignored_secrets_count_by_kind=Counter(),
+                )
+            ],
+            errors=[],
         )
         hook_scanner = AIHookScanner(mock_scanner)
         assert hook_scanner._scan_content(self._payload()).block is False

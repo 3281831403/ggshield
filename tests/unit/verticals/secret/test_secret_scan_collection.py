@@ -161,6 +161,11 @@ def test_create_result_removes_ignored_matches_bis(all_secrets):
         assert len(result.secrets) == 1
         assert result.secrets[0].is_ignored is False
         assert result.ignored_secrets_count_by_kind[IgnoreKind.IGNORED_MATCH] == 1
+    # Whatever all_secrets, the verdict-side view is the same: one break is
+    # ignored, one is not.
+    assert len(result.non_ignored_secrets) == 1
+    assert result.has_non_ignored_secrets is True
+    assert result.has_ignored_secrets is True
 
 
 class TestComputeIgnoreReason:

@@ -248,7 +248,7 @@ def scan_commit_range(
         id=scan_context.command_id, type="commit-range", scans=scans
     )
     error = report_scan_failures(
-        failures, found_secrets=collection.total_secrets_count > 0
+        failures, found_secrets=collection.total_non_ignored_secrets_count > 0
     )
     if error is not None:
         collection.results = Results(errors=[error])

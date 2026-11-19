@@ -553,6 +553,37 @@ class TestScanDirectory:
                         f"{nb_ignored} secret{'s' if nb_ignored != 1 else ''} ignored"
                     ) in result.output
 
+    @pytest.mark.parametrize("all_secrets", (True, False))
+    def test_all_secrets_does_not_change_the_exit_code(
+        self, cli_fs_runner, all_secrets
+    ):
+        """--all-secrets only changes the display: a scan whose hits are all
+        ignored must exit 0 with or without it, while still showing the
+        ignored hits and their reason."""
+        write_text(Path("file_secret"), _ONE_LINE_AND_MULTILINE_PATCH)
+        all_secrets_option = ["--all-secrets"] if all_secrets else []
+        with my_vcr.use_cassette("test_scan_path_file_one_line_and_multiline_patch"):
+            result = cli_fs_runner.invoke(
+                cli,
+                [
+                    "secret",
+                    "scan",
+                    "-v",
+                    "-b",
+                    "SendGrid Key",
+                    "-b",
+                    "RSA Private Key",
+                    "path",
+                    "file_secret",
+                    *all_secrets_option,
+                ],
+            )
+            assert result.exit_code == ExitCode.SUCCESS, result.output
+            if all_secrets:
+                assert "Ignored: " in result.output
+            else:
+                assert "2 secrets ignored" in result.output
+
     @patch("pygitguardian.GGClient.multi_content_scan")
     @my_vcr.use_cassette("test_scan_context_repository.yaml")
     def test_scan_context_repository(

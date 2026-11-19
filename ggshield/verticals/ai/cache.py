@@ -72,19 +72,19 @@ def config_fingerprint(secret_config: SecretConfig) -> str:
     misses without preventing a stale verdict.
 
     - filename_only rewrites the filename we send, and the key holds the local one
-    - all_secrets moves locally-ignored breaks into `secrets` instead of
-      `ignored_secrets_count_by_kind`, which is the guard that decides whether a
-      verdict is cacheable at all
     - source_uuid switches the endpoint to scan_and_create_incidents; the hook
       clears it, so it is constant today, but stays in the key so a verdict from
       an older ggshield is never served here
 
+    all_secrets is deliberately absent: it only decides whether ignored breaks
+    are kept in `secrets` for display, and the verdict (AIHookScanner._scan_contents)
+    and the cacheability guard (Result.has_ignored_secrets) both look past it.
+
     The ignore settings (ignored_matches, ignored_detectors,
     ignore_known_secrets) are deliberately absent: a verdict that depended on
-    them is never stored, see AIHookScanner._scan_content.
+    them is never stored, see AIHookScanner._scan_contents.
     """
     return (
-        f"all_secrets={int(secret_config.all_secrets)};"
         f"filename_only={int(secret_config.filename_only)};"
         f"source_uuid={secret_config.source_uuid or ''}"
     )

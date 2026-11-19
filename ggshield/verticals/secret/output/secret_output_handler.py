@@ -56,6 +56,8 @@ class SecretOutputHandler(ABC):
         raise NotImplementedError()
 
     def _get_exit_code(self, scan: SecretScanCollection) -> ExitCode:
-        if scan.total_secrets_count > 0:
+        # Ignored breaks stay in `secrets` with --all-secrets, for display only:
+        # the ignore rules, not the display option, decide whether the scan fails.
+        if scan.total_non_ignored_secrets_count > 0:
             return ExitCode.SCAN_FOUND_PROBLEMS
         return ExitCode.SUCCESS

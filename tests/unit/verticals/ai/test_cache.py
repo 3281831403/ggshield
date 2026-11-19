@@ -444,8 +444,6 @@ class TestVerdictKey:
         [
             # Rewrites the filename we send.
             {"filename_only": True},
-            # Changes which policy breaks land in `secrets`.
-            {"all_secrets": True},
             # Switches the endpoint to scan_and_create_incidents.
             {"source_uuid": UUID("11111111-1111-1111-1111-111111111111")},
         ],
@@ -460,8 +458,11 @@ class TestVerdictKey:
         [
             # Presentation only.
             {"show_secrets": True},
+            # Display only: ignored breaks stay in `secrets`, but the verdict
+            # and the cacheability guard both look past them.
+            {"all_secrets": True},
             # A verdict that depended on it is never stored in the first place,
-            # see AIHookScanner._scan_content.
+            # see AIHookScanner._scan_contents.
             {"ignore_known_secrets": True},
         ],
     )

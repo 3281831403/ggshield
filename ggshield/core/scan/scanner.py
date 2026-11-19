@@ -34,6 +34,12 @@ class SecretProtocol(Protocol):
     def incident_url(self) -> Optional[str]: ...
 
     @property
+    def is_ignored(self) -> bool:
+        """Ignored breaks stay in `secrets` with all_secrets, for display only:
+        they must never decide a verdict."""
+        ...
+
+    @property
     def matches(self) -> Sequence[Match]: ...
 
     def get_ignore_sha(self) -> str: ...
@@ -53,6 +59,12 @@ class ResultProtocol(Protocol):
     def ignored_secrets_count_by_kind(self) -> Mapping[Any, int]:
         """Secrets the API reported but ggshield filtered out locally. Non-empty
         means `secrets` reflects the local configuration, not just the API."""
+        ...
+
+    @property
+    def has_ignored_secrets(self) -> bool:
+        """Whether any break was ignored locally, kept in `secrets`
+        (all_secrets) or counted in `ignored_secrets_count_by_kind`."""
         ...
 
 

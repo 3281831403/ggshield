@@ -822,11 +822,17 @@ class AIHookScanner:
                     # Scan said nothing about this document (skipped or degraded): not
                     # a verdict, so nothing to cache and nothing to block on.
                     continue
-                secrets: List[Secret] = list(result.secrets)
+                # Ignored breaks stay in `secrets` with all_secrets, for display
+                # only: the ignore rules, not the display option, decide whether
+                # the hook blocks.
+                secrets: List[Secret] = [
+                    secret for secret in result.secrets if not secret.is_ignored
+                ]
                 if not secrets:
-                    # Per-document: cache only if nothing was filtered out locally,
-                    # else "no secret" is a verdict about the config, not the content.
-                    if key and not result.ignored_secrets_count_by_kind:
+                    # Per-document: cache only if nothing was ignored locally,
+                    # else "no secret" is a verdict about the config, not the
+                    # content.
+                    if key and not result.has_ignored_secrets:
                         store_clean_verdict(key)
                     continue
                 payload = payloads[index]

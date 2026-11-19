@@ -247,6 +247,10 @@ class SecretScanner:
             for file, scan_result in zip(chunk, scan.scan_results):
                 result = Result.from_scan_result(file, scan_result, self.secret_config)
                 for secret in result.secrets:
+                    if secret.is_ignored:
+                        # Kept for display only (all_secrets): already ignored,
+                        # so `secret ignore --last-found` has nothing to add.
+                        continue
                     self.cache.add_found_policy_break(
                         secret.detector_display_name,
                         secret.get_ignore_sha(),
@@ -256,7 +260,9 @@ class SecretScanner:
 
         self.cache.save()
         collected = Results(results=results)
-        error = report_scan_failures(failures, found_secrets=collected.has_secrets)
+        error = report_scan_failures(
+            failures, found_secrets=collected.has_non_ignored_secrets
+        )
         if error is not None:
             collected.errors.append(error)
         return collected

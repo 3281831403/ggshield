@@ -156,6 +156,25 @@ class Result:
     def has_secrets(self) -> bool:
         return len(self.secrets) > 0
 
+    @property
+    def non_ignored_secrets(self) -> List[Secret]:
+        """The secrets no ignore rule covers: they alone decide the verdict.
+        With `all_secrets`, ignored breaks stay in `secrets` for display, so
+        `secrets` itself must never be used to gate."""
+        return [secret for secret in self.secrets if not secret.is_ignored]
+
+    @property
+    def has_non_ignored_secrets(self) -> bool:
+        return any(not secret.is_ignored for secret in self.secrets)
+
+    @property
+    def has_ignored_secrets(self) -> bool:
+        """Whether any break was ignored locally, whether it was kept in
+        `secrets` (`all_secrets`) or counted in `ignored_secrets_count_by_kind`."""
+        return bool(self.ignored_secrets_count_by_kind) or any(
+            secret.is_ignored for secret in self.secrets
+        )
+
     @classmethod
     def from_scan_result(
         cls, file: Scannable, scan_result: ScanResult, secret_config: SecretConfig
@@ -267,6 +286,10 @@ class Results:
     def has_secrets(self) -> bool:
         return any(x.has_secrets for x in self.results)
 
+    @property
+    def has_non_ignored_secrets(self) -> bool:
+        return any(x.has_non_ignored_secrets for x in self.results)
+
 
 class SecretScanCollection:
     id: str
@@ -294,6 +317,11 @@ class SecretScanCollection:
 
         self.total_secrets_count = sum(
             len(result.secrets) for result in self.get_all_results()
+        )
+        # Ignored breaks stay in `secrets` with `all_secrets`: they are
+        # displayed, but they must not fail the scan.
+        self.total_non_ignored_secrets_count = sum(
+            len(result.non_ignored_secrets) for result in self.get_all_results()
         )
 
     @property
