@@ -1,6 +1,8 @@
 import json
+from collections import Counter
 from copy import deepcopy
-from typing import Any, Dict, TypedDict
+from pathlib import Path
+from typing import Any, Dict, List, TypedDict
 from unittest import mock
 
 import pytest
@@ -11,10 +13,22 @@ from voluptuous import Optional as VOptional
 from voluptuous import validators
 
 from ggshield.core.config.user_config import SecretConfig
+from ggshield.core.lines import Line, get_lines_from_content
+from ggshield.core.match_span import MatchSpan
 from ggshield.core.scan import Commit
+from ggshield.utils.git_shell import Filemode
 from ggshield.verticals.secret import Result, Results, SecretScanCollection
-from ggshield.verticals.secret.output import SecretSARIFOutputHandler
-from ggshield.verticals.secret.output.secret_sarif_output_handler import SCHEMA_URL
+from ggshield.verticals.secret.extended_match import ExtendedMatch
+from ggshield.verticals.secret.output import (
+    SecretJSONOutputHandler,
+    SecretSARIFOutputHandler,
+)
+from ggshield.verticals.secret.output.secret_sarif_output_handler import (
+    IGNORE_SHA_FINGERPRINT_KEY,
+    SCHEMA_URL,
+    UNIQUE_FINGERPRINT_KEY,
+)
+from ggshield.verticals.secret.secret_scan_collection import Result as SecretResult
 from ggshield.verticals.secret.secret_scan_collection import Secret
 from tests.factories import PolicyBreakFactory, ScannableFactory, ScanResultFactory
 from tests.unit.conftest import (
@@ -30,6 +44,12 @@ from tests.unit.conftest import (
 
 VERSION_VALIDATOR = validators.Match(r"\d+\.\d+\.\d+")
 
+SARIF_RULE_SCHEMA = S(
+    {
+        "id": str,
+        VOptional("helpUri"): str,
+    }
+)
 
 TOOL_SCHEMA = S(
     {
@@ -38,6 +58,7 @@ TOOL_SCHEMA = S(
             "name": "ggshield",
             "informationUri": str,
             "version": VERSION_VALIDATOR,
+            "rules": [SARIF_RULE_SCHEMA],
         },
         "extensions": [
             {
@@ -52,7 +73,26 @@ EMPTY_RESULT_SCHEMA = S(
     {
         "version": "2.1.0",
         "$schema": SCHEMA_URL,
-        "runs": [{"tool": TOOL_SCHEMA, "results": []}],
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "organization": "GitGuardian",
+                        "name": "ggshield",
+                        "informationUri": str,
+                        "version": VERSION_VALIDATOR,
+                        "rules": [],
+                    },
+                    "extensions": [
+                        {
+                            "name": str,
+                            "version": VERSION_VALIDATOR,
+                        }
+                    ],
+                },
+                "results": [],
+            }
+        ],
     }
 )
 
@@ -75,6 +115,7 @@ SARIF_PHYSICAL_LOCATION_DICT_SCHEMA = S(
 SARIF_RESULT_DICT_SCHEMA = S(
     {
         "ruleId": str,
+        "ruleIndex": int,
         "level": "error",
         "message": {
             "text": str,
@@ -92,7 +133,10 @@ SARIF_RESULT_DICT_SCHEMA = S(
                 "message": {"text": str},
             }
         ],
-        "partialFingerprints": {"secret/v1": str},
+        "partialFingerprints": {
+            IGNORE_SHA_FINGERPRINT_KEY: str,
+            UNIQUE_FINGERPRINT_KEY: str,
+        },
         VOptional("hostedViewerUri"): str,
         VOptional("properties"): {
             VOptional("incidentDetails"): dict,
@@ -212,11 +256,14 @@ def test_sarif_output_for_flat_scan_with_secrets(
         check_sarif_result(
             sarif_result,
             scannable.content,
+            scannable.filemode,
             secret,
             with_incident_details and known_incidents,
         )
 
     assert len(sarif_results) == len(scan_result.policy_breaks)
+    check_rules(json_dict, sarif_results)
+    check_fingerprints_are_unique(sarif_results)
 
 
 PATCHES_AND_RESULTS = [
@@ -247,10 +294,12 @@ def test_sarif_output_for_nested_scan(init_secrets_engine_version):
 
     nested_scans = []
     contents = []
+    filemodes = []
     for idx, (patch, scan_result) in enumerate(PATCHES_AND_RESULTS):
         commit = Commit.from_patch(patch, sha=f"abcd{idx}")
         scannable = next(commit.get_files())
         contents.append(scannable.content)
+        filemodes.append(scannable.filemode)
 
         result = Result.from_scan_result(
             file=scannable, scan_result=scan_result, secret_config=SecretConfig()
@@ -271,15 +320,45 @@ def test_sarif_output_for_nested_scan(init_secrets_engine_version):
 
     # Check each found secret is correctly represented
     sarif_results = json_dict["runs"][0]["results"]
-    for content, sarif_result, secret in zip(contents, sarif_results, secrets):
-        check_sarif_result(sarif_result, content, secret)
+    for content, filemode, sarif_result, secret in zip(
+        contents, filemodes, sarif_results, secrets
+    ):
+        check_sarif_result(sarif_result, content, filemode, secret)
 
     assert len(sarif_results) == len(secrets)
+    check_rules(json_dict, sarif_results)
+    check_fingerprints_are_unique(sarif_results)
+
+
+def check_rules(json_dict: Dict[str, Any], sarif_results: List[Dict[str, Any]]) -> None:
+    """Every result references a rule declared in driver.rules."""
+    rules = json_dict["runs"][0]["tool"]["driver"]["rules"]
+    rule_ids = [rule["id"] for rule in rules]
+
+    # Rule ids are unique
+    assert len(rule_ids) == len(set(rule_ids))
+
+    for sarif_result in sarif_results:
+        rule_id = sarif_result["ruleId"]
+        rule_index = sarif_result["ruleIndex"]
+        assert 0 <= rule_index < len(rules)
+        assert rule_ids[rule_index] == rule_id
+        # Rules only carry the minimal set of properties
+        assert set(rules[rule_index]).issubset({"id", "helpUri"})
+
+
+def check_fingerprints_are_unique(sarif_results: List[Dict[str, Any]]) -> None:
+    """No two results share all their partial fingerprints."""
+    fingerprint_sets = [
+        tuple(sorted(result["partialFingerprints"].items())) for result in sarif_results
+    ]
+    assert len(fingerprint_sets) == len(set(fingerprint_sets))
 
 
 def check_sarif_result(
     sarif_result: Dict[str, Any],
     content: str,
+    filemode: Any,
     secret: Secret,
     contains_incident_details: bool = False,
 ):
@@ -289,17 +368,22 @@ def check_sarif_result(
     secret_name = sarif_result["ruleId"]
     assert secret_name == secret.detector_display_name
 
-    # Check the matches point to the right part of the content. `expected_matches`
-    # and `actual matches` are dicts of match_name => matched_text.
-    expected_matches = {
-        m.match_type: content[m.index_start : m.index_end + 1] for m in secret.matches
-    }
+    # Check the uri is a plain document path, without any internal
+    # commit:// / file:// URL scheme
+    uri = sarif_result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert "://" not in uri
+
+    # Check the matches point to the right part of the content. Regions use the
+    # real line numbers of the scanned document (Line.pre_index / post_index),
+    # not patch-relative indices.
+    lines = get_lines_from_content(content, filemode)
+    expected_matches = {m.match_type: m.match for m in secret.matches}
 
     actual_matches = {}
     for location in sarif_result["relatedLocations"]:
         match_name = location["message"]["text"]
         region = location["physicalLocation"]["region"]
-        matched_text = get_content_from_region(content, region)
+        matched_text = get_content_from_region(lines, region)
         actual_matches[match_name] = matched_text
 
     # Check that the markdown message contains the correct is_vaulted information
@@ -323,6 +407,25 @@ def check_sarif_result(
 
     assert actual_matches == expected_matches
 
+    # The secret/v1 fingerprint is the unmodified ignore sha, identical to what
+    # the JSON output exposes
+    assert (
+        sarif_result["partialFingerprints"][IGNORE_SHA_FINGERPRINT_KEY]
+        == secret.get_ignore_sha()
+    )
+
+    # Regions point at the same real line numbers as the JSON occurrences and
+    # text output
+    primary_region = sarif_result["locations"][0]["physicalLocation"]["region"]
+    assert primary_region["startLine"] == min(m.line_start for m in secret.matches)
+    assert primary_region["endLine"] == max(m.line_end for m in secret.matches)
+    for related_location, match in zip(
+        sarif_result["relatedLocations"], secret.matches
+    ):
+        region = related_location["physicalLocation"]["region"]
+        assert region["startLine"] == match.line_start
+        assert region["endLine"] == match.line_end
+
 
 class RegionDict(TypedDict):
     startLine: int
@@ -331,29 +434,30 @@ class RegionDict(TypedDict):
     endColumn: int
 
 
-def get_content_from_region(content: str, region: RegionDict) -> str:
-    # Convert region values into 0-based indices
-    # Make end values point *after* the last element
-    start_line = region["startLine"] - 1
-
-    # endLine is 1-based but points to the line containing the end, so it does not need
-    # to be decreased by 1
-    end_line = region["endLine"]
+def get_content_from_region(lines: List[Any], region: RegionDict) -> str:
+    """Extract the matched text using SARIF regions expressed in real document
+    line numbers. `lines` are the Line objects built from the scanned content,
+    so Line.pre_index / post_index are the line numbers used in the region.
+    """
+    region_lines = [
+        line
+        for line in lines
+        if (line.pre_index or line.post_index)
+        in range(region["startLine"], region["endLine"] + 1)
+    ]
+    assert len(region_lines) == region["endLine"] - region["startLine"] + 1
 
     start_column = region["startColumn"] - 1
-
-    # endColumn is 1-based and points to the character after the match, so it needs to
-    # be decreased by 1
+    # endColumn is 1-based and points to the character after the match, so it
+    # needs to be decreased by 1
     end_column = region["endColumn"] - 1
 
-    lines = content.splitlines()[start_line:end_line]
-
+    contents = [line.content for line in region_lines]
     # Cut start and end. Do the end first because if we cut the start first then
     # `end_column` will be invalid for 1-line regions
-    lines[-1] = lines[-1][:end_column]
-    lines[0] = lines[0][start_column:]
-
-    return "\n".join(lines)
+    contents[-1] = contents[-1][:end_column]
+    contents[0] = contents[0][start_column:]
+    return "\n".join(contents)
 
 
 @pytest.mark.parametrize(
@@ -442,3 +546,336 @@ def test_vault_path_in_sarif_output(
     # Check that all expected messages are present
     for expected_message in expected_messages:
         assert expected_message in markdown_message
+
+
+def _make_extended_match(
+    match: str,
+    match_type: str,
+    span_line_start: int,
+    span_line_end: int,
+    real_line_start: int,
+    real_line_end: int,
+    column_start: int = 0,
+    column_end: int | None = None,
+):
+    """Build an ExtendedMatch without scanning, with distinct patch-relative
+    span indices and real document line numbers."""
+    if column_end is None:
+        column_end = len(match)
+    lines_with_secret = [Line(content=match, is_patch=True)]
+    return ExtendedMatch(
+        span=MatchSpan(
+            line_index_start=span_line_start,
+            line_index_end=span_line_end,
+            column_index_start=column_start,
+            column_index_end=column_end,
+        ),
+        lines_before_secret=[],
+        lines_with_secret=lines_with_secret,
+        lines_after_secret=[],
+        match=match,
+        index_start=column_start,
+        index_end=column_end - 1,
+        match_type=match_type,
+        line_start=real_line_start,
+        line_end=real_line_end,
+        pre_line_start=real_line_start,
+        pre_line_end=real_line_end,
+        post_line_start=real_line_start,
+        post_line_end=real_line_end,
+    )
+
+
+def _make_result(url, path, filemode, secrets):
+    return SecretResult(
+        filename=url,
+        filemode=filemode,
+        path=Path(path),
+        url=url,
+        secrets=secrets,
+        ignored_secrets_count_by_kind=Counter(),
+    )
+
+
+def _make_secret(matches, detector="MySQL Assignment"):
+    return Secret(
+        detector_display_name=detector,
+        detector_name="mysql_assignment",
+        detector_group_name="mysql_credentials",
+        documentation_url="https://example.com/docs/mysql",
+        validity="valid",
+        known_secret=False,
+        incident_url=None,
+        matches=matches,
+        ignore_reason=None,
+        diff_kind=None,
+        is_vaulted=False,
+        vault_type=None,
+        vault_name=None,
+        vault_path=None,
+        vault_path_count=None,
+    )
+
+
+def _run_sarif(result):
+    scan = SecretScanCollection(
+        id="scan", type="test", results=Results(results=[result])
+    )
+    handler = SecretSARIFOutputHandler(
+        verbose=True, secret_config=SecretConfig(show_secrets=False)
+    )
+    return json.loads(handler._process_scan_impl(scan))
+
+
+def test_sarif_uses_real_document_line_numbers_not_patch_indices(
+    init_secrets_engine_version,
+):
+    """
+    GIVEN a patch whose hunk starts far from line 1, so patch-relative line
+          indices differ from real document line numbers
+    WHEN the SARIF output is generated
+    THEN the regions use the same real line numbers as JSON occurrences and the
+         text output (ExtendedMatch.line_start / line_end)
+    """
+    match = _make_extended_match(
+        match="sg_key",
+        match_type="apikey",
+        # The match is the 2nd line of the patch content sent to the engine...
+        span_line_start=1,
+        span_line_end=1,
+        # ...but line 151 of the real document
+        real_line_start=151,
+        real_line_end=151,
+    )
+    result = _make_result(
+        url="commit://deadbeef/svc/creds.py",
+        path="svc/creds.py",
+        filemode=Filemode.MODIFY,
+        secrets=[_make_secret([match])],
+    )
+
+    json_dict = _run_sarif(result)
+    region = json_dict["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "region"
+    ]
+    assert region["startLine"] == 151
+    assert region["endLine"] == 151
+
+    related_region = json_dict["runs"][0]["results"][0]["relatedLocations"][0][
+        "physicalLocation"
+    ]["region"]
+    assert related_region["startLine"] == 151
+
+
+def test_sarif_uri_strips_internal_url_schemes(init_secrets_engine_version):
+    """
+    GIVEN results coming from commit-range and absolute-path scans
+    WHEN the SARIF output is generated
+    THEN artifact uris are plain repository-relative paths with no commit:// or
+         file:// prefix, matching the JSON filename and text output
+    """
+
+    commit_match = _make_extended_match("a-secret", "apikey", 0, 0, 20, 20)
+    commit_result = _make_result(
+        url="commit://deadbeef/svc/creds.py",
+        path="svc/creds.py",
+        filemode=Filemode.MODIFY,
+        secrets=[_make_secret([commit_match])],
+    )
+
+    file_match = _make_extended_match("b-secret", "apikey", 0, 0, 3, 3)
+    file_result = _make_result(
+        url="file:///home/me/repo/svc/creds.py",
+        path="/home/me/repo/svc/creds.py",
+        filemode=Filemode.FILE,
+        secrets=[_make_secret([file_match], detector="AWS Keys")],
+    )
+
+    scan = SecretScanCollection(
+        id="scan",
+        type="test",
+        results=Results(results=[commit_result, file_result]),
+    )
+    handler = SecretSARIFOutputHandler(
+        verbose=True, secret_config=SecretConfig(show_secrets=False)
+    )
+    json_dict = json.loads(handler._process_scan_impl(scan))
+
+    uris = [
+        r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for r in json_dict["runs"][0]["results"]
+    ]
+    assert uris == ["svc/creds.py", "/home/me/repo/svc/creds.py"]
+    assert all("://" not in uri for uri in uris)
+
+
+def test_sarif_keeps_docset_document_id(init_secrets_engine_version):
+    """
+    GIVEN a docset scan whose document id is a full URL
+    WHEN the SARIF output is generated
+    THEN the artifact uri is the document id, unchanged (same identifier as the
+         text and JSON outputs)
+    """
+
+    document_id = "https://github.com/owner/repo/issues/4#issuecomment-10069"
+    match = _make_extended_match("c-secret", "apikey", 0, 0, 1, 1)
+    result = _make_result(
+        url=document_id,
+        path=document_id,
+        filemode=Filemode.FILE,
+        secrets=[_make_secret([match])],
+    )
+
+    json_dict = _run_sarif(result)
+    uri = json_dict["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]["uri"]
+    assert uri == document_id
+
+
+def test_sarif_results_with_shared_ignore_sha_have_unique_fingerprints(
+    init_secrets_engine_version,
+):
+    """
+    GIVEN several secrets with identical matches (so the JSON output groups them
+          into one incident and they share the same ignore_sha)
+    WHEN the SARIF output is generated
+    THEN each secret gets its own result, secret/v1 stays the ignore sha, and the
+         full partialFingerprints of every result are unique
+    """
+
+    # Same match content -> same ignore sha, but different real locations
+    secrets = []
+    for real_line in (20, 45, 80, 132):
+        match = _make_extended_match(
+            "duplicated-secret", "apikey", 0, 0, real_line, real_line
+        )
+        secrets.append(_make_secret([match]))
+
+    ignore_shas = {secret.get_ignore_sha() for secret in secrets}
+    assert len(ignore_shas) == 1  # sanity check: they really share an ignore sha
+    shared_ignore_sha = ignore_shas.pop()
+
+    result = _make_result(
+        url="commit://deadbeef/svc/creds.py",
+        path="svc/creds.py",
+        filemode=Filemode.MODIFY,
+        secrets=secrets,
+    )
+    json_dict = _run_sarif(result)
+    sarif_results = json_dict["runs"][0]["results"]
+
+    # One SARIF result per secret (each JSON incident occurrence)
+    assert len(sarif_results) == len(secrets)
+
+    # secret/v1 is the unmodified ignore sha
+    assert all(
+        r["partialFingerprints"][IGNORE_SHA_FINGERPRINT_KEY] == shared_ignore_sha
+        for r in sarif_results
+    )
+
+    # But the full fingerprint sets are all different
+    fingerprint_sets = [
+        tuple(sorted(r["partialFingerprints"].items())) for r in sarif_results
+    ]
+    assert len(set(fingerprint_sets)) == len(sarif_results)
+
+    # And the occurrence hashes themselves are unique
+    occurrence_hashes = [
+        r["partialFingerprints"][UNIQUE_FINGERPRINT_KEY] for r in sarif_results
+    ]
+    assert len(set(occurrence_hashes)) == len(occurrence_hashes)
+
+
+def test_sarif_result_count_matches_policy_breaks_and_rules_are_referenced(
+    init_secrets_engine_version,
+):
+    """
+    GIVEN secrets from several detectors
+    WHEN the SARIF output is generated
+    THEN driver.rules declares one rule per detector and every result references
+         a valid ruleIndex
+    """
+
+    secrets = [
+        _make_secret(
+            [_make_extended_match("s1", "apikey", 0, 0, 2, 2)],
+            detector="Detector A",
+        ),
+        _make_secret(
+            [_make_extended_match("s2", "password", 0, 0, 5, 5)],
+            detector="Detector B",
+        ),
+        _make_secret(
+            [_make_extended_match("s3", "token", 0, 0, 9, 9)],
+            detector="Detector A",
+        ),
+    ]
+    result = _make_result(
+        url="svc/creds.py",
+        path="svc/creds.py",
+        filemode=Filemode.FILE,
+        secrets=secrets,
+    )
+    json_dict = _run_sarif(result)
+    run = json_dict["runs"][0]
+    rules = run["tool"]["driver"]["rules"]
+
+    assert [rule["id"] for rule in rules] == ["Detector A", "Detector B"]
+    # First rule carries the detector documentation url
+    assert rules[0]["helpUri"] == "https://example.com/docs/mysql"
+
+    for sarif_result in run["results"]:
+        rule = rules[sarif_result["ruleIndex"]]
+        assert rule["id"] == sarif_result["ruleId"]
+
+
+def test_sarif_matches_json_incident_identity(init_secrets_engine_version):
+    """
+    GIVEN one scanned document with one secret
+    WHEN both SARIF and JSON outputs are generated
+    THEN the SARIF result points at the same path and line as the JSON incident
+         occurrence, and carries the same ignore sha
+    """
+
+    match = _make_extended_match(
+        "json-sarif-secret", "apikey", 0, 0, 20, 20, column_start=4, column_end=21
+    )
+    secret = _make_secret([match])
+    result = _make_result(
+        url="commit://deadbeef/svc/creds.py",
+        path="svc/creds.py",
+        filemode=Filemode.MODIFY,
+        secrets=[secret],
+    )
+
+    sarif_dict = _run_sarif(result)
+    sarif_result = sarif_dict["runs"][0]["results"][0]
+
+    json_handler = SecretJSONOutputHandler(
+        verbose=True, secret_config=SecretConfig(show_secrets=False)
+    )
+    json_dict = json.loads(
+        json_handler._process_scan_impl(
+            SecretScanCollection(
+                id="scan", type="test", results=Results(results=[result])
+            )
+        )
+    )
+    entity = json_dict["entities_with_incidents"][0]
+    incident = entity["incidents"][0]
+    occurrence = incident["occurrences"][0]
+
+    # Same repository-relative path
+    assert (
+        sarif_result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        == entity["filename"]
+    )
+    # Same real line number
+    region = sarif_result["locations"][0]["physicalLocation"]["region"]
+    assert region["startLine"] == occurrence["line_start"] == 20
+    # Same ignore sha
+    assert (
+        sarif_result["partialFingerprints"][IGNORE_SHA_FINGERPRINT_KEY]
+        == incident["ignore_sha"]
+    )
